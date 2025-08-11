@@ -4,8 +4,9 @@ import logging
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from twilio.twiml.messaging_response import MessagingResponse
+
+import httpx
 from openai import OpenAI
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 from ciao_booking_client import CiaoBookingClient
 from utils import normalize_sender, clamp_history
@@ -20,8 +21,18 @@ logger = logging.getLogger(__name__)
 # -------- Flask --------
 app = Flask(__name__)
 
-# -------- OpenAI client --------
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# -------- OpenAI client (fix: niente proxies=; supporto proxy via httpx) --------
+def make_openai_client():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY mancante nelle env vars")
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if proxy:
+        http_client = httpx.Client(proxies=proxy, timeout=30.0, follow_redirects=True)
+        return OpenAI(api_key=api_key, http_client=http_client)
+    return OpenAI(api_key=api_key)
+
+client = make_openai_client()
 
 # -------- Knowledge Base --------
 with open("knowledge_base.json", "r", encoding="utf-8") as f:
@@ -36,11 +47,6 @@ CB = CiaoBookingClient(
 )
 
 # -------- Memoria conversazionale in RAM --------
-# session_store[phone] = {
-#   "history": [{"role":"user/assistant","content":"..."}],
-#   "booking_ctx": {...},
-#   "created_at": ISO,
-# }
 session_store = {}
 
 SYSTEM_INSTRUCTIONS = (
