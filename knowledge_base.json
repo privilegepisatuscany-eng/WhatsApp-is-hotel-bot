@@ -1,0 +1,48 @@
+{
+  "transfer": {
+    "price_airport_city": "50€",
+    "price_city_city": "40€",
+    "payment": "contanti o carta",
+    "required_fields": ["persone", "orario", "partenza", "destinazione"]
+  },
+  "parking": {
+    "Relais dell’Ussero": "Parcheggio pubblico Piazza Carrara (1,50€/h) a pochi metri.",
+    "Casa Monic": "P.za Carrara o P.za Santa Caterina (pubblici), ~400m, 1,50€/h.",
+    "Belle Vue": "Sotto al palazzo in Via A. Rosmini o Via P. Galluppi (08–14 pagamento, poi gratis). Custodito H24 a pagamento in Via Piave.",
+    "Villino di Monic": "Parcheggio privato incluso.",
+    "Casa di Gina": "Via Crispi, P.za Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h)."
+  },
+  "videos": {
+    "Relais dell’Ussero": {
+      "checkin": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share"
+    },
+    "Casa Monic": {
+      "checkin": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
+      "corrente": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share"
+    },
+    "Belle Vue": {
+      "checkin": "https://youtube.com/shorts/1iqknGhIFEc?feature=share"
+    },
+    "Casa di Gina": {
+      "checkin": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share"
+    }
+  },
+  "power": {
+    "Casa Monic": "Se salta la corrente: in cucina (a sinistra) c’è il quadro elettrico. Se non basta, controlla il quadro generale accanto al portone verde (armadio cassette posta), contatore con nome COSCI: solleva la leva.",
+    "Relais dell’Ussero": "Se manca, avvisa subito Niccolò; non forzare ascensore.",
+    "Belle Vue": "Controlla magnetotermici in casa; se persiste, contatta host.",
+    "Casa di Gina": "Controlla quadro in ingresso; se persiste, contatta host.",
+    "Villino di Monic": "Controlla quadro interno; se persiste, contatta host."
+  },
+  "hours": {
+    "checkin": "15:00 - 04:00",
+    "checkout": "10:00"
+  },
+  "contacts": {
+    "monica": "+39 351 8143662",
+    "niccolo": "+39 333 6011867",
+    "instagram": "@privilege_pisa",
+    "site": "www.privilegepisatuscany.com",
+    "email": "privilegepisatuscany@gmail.com"
+  }
+}
