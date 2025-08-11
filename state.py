@@ -1,28 +1,20 @@
-
 import time
-from typing import Dict, Any
+import threading
 
-_TTL_SECONDS = 60 * 30  # 30 minuti
-
-class _StateStore:
+class MemoryStore:
     def __init__(self):
-        self._data: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._data = {}
 
-    def get(self, key: str) -> Dict[str, Any]:
-        s = self._data.get(key, {})
-        if not s:
-            return {}
-        if s.get("_expires_at", 0) < time.time():
-            self._data.pop(key, None)
-            return {}
-        return s
+    def get(self, key):
+        with self._lock:
+            return self._data.get(key)
 
-    def set(self, key: str, value: Dict[str, Any], ttl: int = _TTL_SECONDS):
-        value = dict(value)
-        value["_expires_at"] = time.time() + ttl
-        self._data[key] = value
+    def set(self, key, value):
+        with self._lock:
+            self._data[key] = value
 
-    def reset(self, key: str):
-        self._data.pop(key, None)
-
-STATE = _StateStore()
+    def clear(self, key):
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
