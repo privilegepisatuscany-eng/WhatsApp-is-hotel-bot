@@ -1,356 +1,348 @@
-# app.py
-import os, json, re, logging, time
-from flask import Flask, request, jsonify, Response
+import os
+import re
+import time
+import logging
+from flask import Flask, request, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
+from ciao_booking_client import CiaoBookingClient
 
-# === Logging robusto (accetta "debug", "INFO", ecc.) ===
-def _coerce_level(val: str):
-    if isinstance(val, str):
-        v = val.strip().upper()
-        return getattr(logging, v, logging.INFO)
-    return val if isinstance(val, int) else logging.INFO
-
+# ------------------------------------------------------------------------------
+# Logging (accetta "debug", "INFO", ecc.)
+# ------------------------------------------------------------------------------
+_level_str = os.environ.get("LOG_LEVEL", "INFO")
+_level_map = {
+    "CRITICAL": logging.CRITICAL, "critical": logging.CRITICAL,
+    "ERROR": logging.ERROR,       "error": logging.ERROR,
+    "WARNING": logging.WARNING,   "warning": logging.WARNING,
+    "INFO": logging.INFO,         "info": logging.INFO,
+    "DEBUG": logging.DEBUG,       "debug": logging.DEBUG,
+}
 logging.basicConfig(
-    level=_coerce_level(os.environ.get("LOG_LEVEL", "INFO")),
-    format="%(asctime)s %(levelname)s %(message)s"
+    level=_level_map.get(_level_str, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
 
-# === Flask app ===
+# ------------------------------------------------------------------------------
+# Flask app
+# ------------------------------------------------------------------------------
 app = Flask(__name__)
 
-# === OpenAI client ===
+# ------------------------------------------------------------------------------
+# OpenAI client (usa openai>=1.x)
+# ------------------------------------------------------------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY non impostata")
-client = OpenAI(api_key=OPENAI_API_KEY)
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    logging.warning("OPENAI_API_KEY non impostata: le risposte GPT non funzioneranno.")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # veloce/economico, cambia se vuoi
 
-# === Cache conversazioni (in-memory, per numero) ===
-# Struttura: { from_number: {"started_at": ts, "booking": {...} or None, "property": str|None, "history":[{"role","text"}]} }
-SESSION = {}
+# ------------------------------------------------------------------------------
+# CiaoBooking client
+# ------------------------------------------------------------------------------
+CIAO_BASE = os.environ.get("CIAOBOOKING_BASE_URL", "https://api.ciaobooking.com")
+CIAO_TOKEN = os.environ.get("CIAOBOOKING_TOKEN")  # opzionale, se fornito salta il login
+CIAO_EMAIL = os.environ.get("CIAOBOOKING_EMAIL")
+CIAO_PASSWORD = os.environ.get("CIAOBOOKING_PASSWORD")
+CIAO_SOURCE = os.environ.get("CIAOBOOKING_SOURCE", "whatsapp-bot")
+CIAO_LOCALE = os.environ.get("CIAOBOOKING_LOCALE", "it")
 
-# === Knowledge Base JSON ===
-KB_PATH = os.path.join(os.path.dirname(__file__), "knowledge_base.json")
-try:
-    with open(KB_PATH, "r", encoding="utf-8") as f:
-        KB = json.load(f)
-except Exception as e:
-    log.error("Impossibile caricare knowledge_base.json: %s", e)
-    KB = {}
+ciao = CiaoBookingClient(
+    base_url=CIAO_BASE,
+    static_token=CIAO_TOKEN,
+    email=CIAO_EMAIL,
+    password=CIAO_PASSWORD,
+    source=CIAO_SOURCE,
+    locale=CIAO_LOCALE,
+)
 
-# === CiaoBooking client (import soft) ===
-try:
-    from ciao_booking_client import login_if_needed, find_client_by_phone
-    CIAOBOOKING_OK = True
-except Exception as e:
-    log.error("Import ciao_booking_client fallito: %s", e)
-    CIAOBOOKING_OK = False
-    def login_if_needed(*args, **kwargs): return None
-    def find_client_by_phone(*args, **kwargs): return {"ok": False, "reason": "client module missing"}
+# ------------------------------------------------------------------------------
+# Stato in memoria (per singolo pod)
+# ------------------------------------------------------------------------------
+SESS = {}  # { sender: { "created_at":ts, "booking_ctx":{...}, "last_intent":..., ... } }
+SESSION_TTL_SEC = 60 * 60 * 4  # 4 ore
 
-# Utility
-def normalize_phone(p: str) -> str:
-    """Twilio passa 'whatsapp:+39347...' -> ritorna '39347...'"""
-    if not p: return ""
-    p = p.strip()
-    if p.startswith("whatsapp:"):
-        p = p.split(":", 1)[1]
-    p = p.replace("+", "").replace(" ", "").replace("-", "")
-    return p
+def normalize_sender(raw):
+    # Twilio manda "whatsapp:+39...." -> teniamo solo numero normalizzato (senza +)
+    if not raw:
+        return ""
+    m = re.search(r"\+?(\d+)$", raw)
+    return m.group(1) if m else raw.replace("whatsapp:", "").replace("+", "").strip()
 
-def get_session(num: str) -> dict:
-    s = SESSION.get(num)
-    if not s:
-        s = {"started_at": time.time(), "booking": None, "property": None, "history": []}
-        SESSION[num] = s
+def get_session(sender):
+    now = time.time()
+    s = SESS.get(sender)
+    if not s or (now - s.get("created_at", 0)) > SESSION_TTL_SEC:
+        s = {"created_at": now}
+        SESS[sender] = s
     return s
 
-def add_history(s, role, text):
-    s["history"].append({"role": role, "text": text})
-    # limita a ultime 20 interazioni
-    if len(s["history"]) > 40:
-        s["history"] = s["history"][-40:]
+def ensure_booking_context(sender):
+    """
+    Al primo messaggio della conversazione prova a riconoscere il cliente su CiaoBooking.
+    Cache in memoria per la durata della sessione.
+    """
+    s = get_session(sender)
+    if "booking_ctx" in s:
+        return s["booking_ctx"]
 
-def infer_property_from_text(txt: str) -> str|None:
-    # euristiche leggere
-    t = txt.lower()
-    mapping = {
-        "relais": "Relais dell’Ussero",
-        "ussero": "Relais dell’Ussero",
-        "monic": "Casa Monic",
-        "belle vue": "Belle Vue",
-        "rosmini": "Belle Vue",
-        "gina": "Casa di Gina",
-        "villino": "Villino di Monic",
-        "vincenzo gioberti": "Villino di Monic",
-    }
-    for k,v in mapping.items():
-        if k in t:
-            return v
-    return None
-
-def kb_property_summary(prop: str) -> str:
-    locs = KB.get("locations", {})
-    data = locs.get(prop)
-    if not data:
-        return ""
-    parts = []
-    if "address" in data:
-        parts.append(f"Indirizzo: {data['address']}")
-    info = data.get("info", [])
-    if info:
-        parts.append("Info utili: " + "; ".join(info))
-    return "\n".join(parts)
-
-def build_system_prompt(prop_hint: str|None, booking: dict|None) -> str:
-    base = (
-        "Sei un assistente virtuale per strutture ricettive. "
-        "Usa SOLO le informazioni della knowledge base e i dati della prenotazione quando disponibili. "
-        "Non inventare codici, pin o dettagli non presenti. "
-        "Se una richiesta è fuori KB, chiedi con una domanda corta e precisa le info minime per aiutare.\n\n"
-    )
-    kb_dump = json.dumps(KB, ensure_ascii=False)
-    ctx = []
-    if prop_hint:
-        ctx.append(f"Struttura probabile: {prop_hint}")
-    if booking and booking.get("ok"):
-        b = booking.get("data", {})
-        # includiamo info utili di booking
-        ctx.append(f"Dati prenotazione: status={b.get('status')} checkin={b.get('start_date')} checkout={b.get('end_date')} ospiti={b.get('guests')}")
-        # se possibile property name
-        prop_name = b.get("property_name") or b.get("property")
-        if prop_name:
-            ctx.append(f"Struttura: {prop_name}")
-    context = "\n".join(ctx) if ctx else "Nessun contesto prenotazione disponibile."
-    return base + "CONOSCENZA:\n" + kb_dump + "\n\nCONTESTO:\n" + context
-
-def gpt_reply(system_prompt: str, user: str) -> str:
+    # lookup client by phone; se fallisce NON blocchiamo la conversazione
     try:
-        resp = client.chat.completions.create(
+        ctx = ciao.get_booking_context_by_phone(sender)
+        s["booking_ctx"] = ctx or {"has_client": False}
+        if ctx and ctx.get("has_client"):
+            logging.info("CiaoBooking client trovato: %s", ctx.get("client", {}).get("name"))
+        else:
+            logging.info("CiaoBooking client NON trovato per %s", sender)
+    except Exception as e:
+        logging.error("Errore lookup CiaoBooking: %s", e)
+        s["booking_ctx"] = {"has_client": False, "error": "lookup_failed"}
+
+    return s["booking_ctx"]
+
+def ask_entry_question(has_client):
+    """
+    Prima domanda della conversazione: se c’è prenotazione, chiediamo scopo;
+    se non c’è, chiediamo se ha una prenotazione o vuole info generiche.
+    """
+    if has_client:
+        return ("Ciao! Come posso aiutarti? Scrivi *Taxi/Transfer*, *Parcheggio* "
+                "o *Altro*. Se ti serve l’accesso ti mando i video/istruzioni.")
+    else:
+        return ("Ciao! Hai già una prenotazione con noi? Rispondi *Sì* o *No*.\n"
+                "Oppure dimmi *Parcheggio*, *Taxi/Transfer* o *Altro*.")
+
+# ------------------------------------------------------------------------------
+# Prompt di sistema minimo (il grosso lo decide la logica; GPT è di supporto)
+# ------------------------------------------------------------------------------
+SYSTEM_PROMPT = (
+    "Sei un assistente per una struttura ricettiva a Pisa. "
+    "Sii chiaro, cordiale e conciso; fai domande mirate solo quando servono. "
+    "Se l’utente chiede *Taxi/Transfer*, guida una breve raccolta dati: persone, orario, partenza/destinazione. "
+    "Tariffe: Aeroporto ↔ Città 50€, Città ↔ Città 40€. "
+    "Se chiede *Parcheggio*, chiedi prima in quale struttura si trova (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina) "
+    "e rispondi con le info giuste. Evita di elencare informazioni non richieste."
+)
+
+def gpt_reply(user_msg, booking_ctx):
+    """
+    Fallback/intelligenza per formulare risposte naturali basate su regole minime.
+    """
+    try:
+        msg = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role":"system","content": system_prompt},
-                {"role":"user","content": user}
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg}
             ],
-            temperature=0.2,
-            max_tokens=600,
+            temperature=0.3,
         )
-        return resp.choices[0].message.content.strip()
+        return msg.choices[0].message.content.strip()
     except Exception as e:
-        log.error("OpenAI error: %s", e)
-        return "Mi dispiace, si è verificato un errore tecnico. Riprova tra poco."
+        logging.error("Errore OpenAI: %s", e)
+        return "Mi dispiace, c’è stato un problema temporaneo. Riprova tra poco."
 
-def first_message_bootstrap(from_num: str, text: str, s: dict):
-    """
-    Al primo messaggio: prova lookup su CiaoBooking UNA volta.
-    Non mostra più blocco 🔒: se troviamo la prenotazione usiamo l’informazione,
-    altrimenti chiediamo i dati minimi (nome o numero prenotazione) solo se serve.
-    """
-    if s.get("bootstrapped"):
-        return
-    s["bootstrapped"] = True
-    prop = infer_property_from_text(text)
-    if prop:
-        s["property"] = prop
-
-    # CiaoBooking lookup
-    if CIAOBOOKING_OK:
-        try:
-            login_if_needed()
-            pn = normalize_phone(from_num)
-            bk = find_client_by_phone(pn)  # atteso: {"ok":True/False, "data":{...}} 
-            if bk and bk.get("ok"):
-                s["booking"] = bk
-                # prova a inferire struttura da booking
-                prop_name = (bk.get("data") or {}).get("property_name")
-                if prop_name:
-                    s["property"] = prop_name
-                log.info("CiaoBooking: prenotazione trovata per %s", pn)
-            else:
-                log.info("CiaoBooking: nessuna prenotazione per %s (reason=%s)", pn, bk.get("reason") if bk else "unknown")
-        except Exception as e:
-            log.error("CiaoBooking lookup error: %s", e)
-
-# === ROUTES ===
-@app.get("/")
-def root():
-    return Response("OK", status=200, mimetype="text/plain")
-
-@app.get("/health")
+# ------------------------------------------------------------------------------
+# Webhook Twilio
+# ------------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "uptime": time.time()})
+    return "OK"
 
-@app.get("/test")
-def test_page():
-    # Pagina di test con storico conversazione e textarea
-    html = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Test Bot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#f7f7f8}
-.container{max-width:820px;margin:20px auto;padding:16px}
-.card{background:#fff;border:1px solid #e6e6e9;border-radius:12px;box-shadow:0 8px 16px rgba(0,0,0,0.04);padding:16px}
-.row{display:flex;gap:8px;margin-top:12px}
-input,textarea{width:100%;padding:10px;border:1px solid #d6d6db;border-radius:8px}
-button{padding:10px 14px;border:0;border-radius:8px;background:#0b5cff;color:#fff;cursor:pointer}
-.msg{padding:10px 12px;border-radius:10px;margin:6px 0;max-width:75%;}
-.user{background:#e9f0ff;margin-left:auto}
-.bot{background:#f0f0f1}
-.small{color:#666;font-size:12px}
-</style>
-</head>
-<body>
-<div class="container">
-  <h2>Tester WhatsApp Bot (no Twilio)</h2>
-  <div class="card">
-    <div class="row">
-      <input id="from" placeholder="Numero (es. whatsapp:+39347...)" />
-      <button onclick="reset()">Reset</button>
-    </div>
-    <div id="log" style="min-height:300px;margin-top:12px;"></div>
-    <div class="row">
-      <textarea id="msg" rows="2" placeholder="Scrivi un messaggio..."></textarea>
-      <button onclick="send()">Invia</button>
-    </div>
-    <div class="small">I messaggi vengono inviati al webhook /webhook simulando Twilio.</div>
-  </div>
-</div>
-<script>
-async function send(){
-  const from = document.getElementById('from').value || 'whatsapp:+390000000000';
-  const body = document.getElementById('msg').value;
-  if(!body) return;
-  const form = new URLSearchParams();
-  form.append('From', from);
-  form.append('Body', body);
-  const r = await fetch('/webhook', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form});
-  const text = await r.text();
-  append('user', body);
-  append('bot', text);
-  document.getElementById('msg').value = '';
-}
-async function reset(){
-  const from = document.getElementById('from').value || 'whatsapp:+390000000000';
-  const form = new URLSearchParams();
-  form.append('From', from);
-  form.append('Body', '/reset');
-  await fetch('/webhook', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:form});
-  document.getElementById('log').innerHTML = '';
-}
-function append(who, text){
-  const log = document.getElementById('log');
-  const d = document.createElement('div');
-  d.className = 'msg ' + (who==='user'?'user':'bot');
-  d.textContent = text.replace(/<[^>]+>/g,'');
-  log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
-}
-</script>
-</body>
-</html>
-"""
-    return Response(html, mimetype="text/html")
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    sender_raw = request.form.get("From", "")
+    body = (request.form.get("Body") or "").strip()
+    sender = normalize_sender(sender_raw)
 
-@app.post("/webhook")
-def whatsapp_webhook():
-    from_raw = request.form.get("From", "")
-    body = (request.form.get("Body", "") or "").strip()
-    if not body:
-        tw = MessagingResponse(); tw.message("Ciao! Come posso aiutarti?")
+    logging.debug("Inbound da %s: %s", sender, body)
+
+    # Reset conversazione utente
+    if body.lower() in ("/reset", "reset"):
+        SESS.pop(sender, None)
+        tw = MessagingResponse()
+        tw.message("✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Altro)")
         return str(tw)
 
-    s = get_session(from_raw)
-    add_history(s, "user", body)
+    s = get_session(sender)
+    ctx = ensure_booking_context(sender)  # { has_client:bool, client:{...}?, ... }
 
-    # comandi
-    if body.lower() in ("/reset","reset"):
-        SESSION.pop(from_raw, None)
-        tw = MessagingResponse(); tw.message("✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Altro)")
-        return str(tw)
+    # Stato conversazione
+    last_intent = s.get("last_intent")
 
-    # bootstrap al primo messaggio
-    first_message_bootstrap(from_raw, body, s)
-
-    # Se l’utente chiede subito “prenotazione”, NON mostriamo più 🔒.
-    # Se abbiamo booking → confermiamo presenza e chiediamo il tema; se no → chiediamo nome/cognome SOLO se serve davvero.
-    low = body.lower()
-    if any(k in low for k in ["prenotaz", "ho una prenotazione", "booking"]):
-        if s.get("booking",{}).get("ok"):
+    # 1) Se non c'è ancora un intent, poniamo la domanda di ingresso adatta
+    if not last_intent:
+        # prova a capire l’intent dal testo subito
+        lower = body.lower()
+        if any(k in lower for k in ["taxi", "transfer", "trasfer", "aeroporto", "airport"]):
+            s["last_intent"] = "taxi"
+        elif "parche" in lower:
+            s["last_intent"] = "parking"
+        elif lower in ("si", "sì", "yes") and not ctx.get("has_client"):
+            # utente dice “Sì ho prenotazione” ma ciao booking non conferma → chiediamo nome o cell
             tw = MessagingResponse()
-            tw.message("Ho trovato la tua prenotazione. Come posso aiutarti? Posso darti informazioni su taxi/transfer, parcheggio, check-in o orari.")
+            tw.message("Perfetto! Non trovo la prenotazione con questo numero. Puoi indicarmi *nome e cognome* usati in prenotazione o *il numero di telefono* associato?")
+            return str(tw)
+        elif lower in ("no", "non ancora", "no grazie"):
+            tw = MessagingResponse()
+            tw.message("Nessun problema. Posso aiutarti con *Taxi/Transfer*, *Parcheggio* o informazioni sulla *struttura*.")
+            return str(tw)
+        else:
+            # domanda di ingresso coerente con presenza prenotazione
+            tw = MessagingResponse()
+            tw.message(ask_entry_question(ctx.get("has_client", False)))
+            return str(tw)
+
+    # 2) Intent TAXI
+    if s.get("last_intent") == "taxi":
+        # Raccogliamo in sessione i campi che mancano
+        form = s.get("taxi_form", {"people": None, "time": None, "from": None, "to": None})
+        lower = body.lower()
+
+        # Heuristics leggere per estrarre info rapide dal testo
+        # persone (numero)
+        if form["people"] is None:
+            m = re.search(r"\b([1-9]\d?)\b", body)
+            if m:
+                form["people"] = m.group(1)
+            else:
+                tw = MessagingResponse()
+                tw.message("Quante persone siete?")
+                s["taxi_form"] = form
+                return str(tw)
+
+        # orario
+        if form["time"] is None:
+            m = re.search(r"\b(\d{1,2}[:.]\d{2})\b", body)
+            if m:
+                form["time"] = m.group(1).replace(".", ":")
+            else:
+                tw = MessagingResponse()
+                tw.message("A che ora desideri la partenza? (es. 14:30)")
+                s["taxi_form"] = form
+                return str(tw)
+
+        # partenza/destinazione: se nel testo iniziale c'era “aeroporto” deduciamo
+        if form["from"] is None or form["to"] is None:
+            if any(k in lower for k in ["aeroporto", "airport"]):
+                # Se ha nominato aeroporto senza dire altro, chiedi l’altro estremo
+                if form["from"] is None and form["to"] is None:
+                    # prova a capire direzione: “dall’aeroporto” vs “all’aeroporto”
+                    if "dall" in lower or "da aeroporto" in lower:
+                        form["from"] = "Aeroporto"
+                    elif "all" in lower or "verso aeroporto" in lower:
+                        form["to"] = "Aeroporto"
+            # se ancora manca qualcosa, chiedi in modo esplicito
+            if form["from"] is None:
+                tw = MessagingResponse()
+                tw.message("Qual è il *punto di partenza*? (es. Aeroporto o nome della struttura)")
+                s["taxi_form"] = form
+                return str(tw)
+            if form["to"] is None:
+                tw = MessagingResponse()
+                tw.message("Qual è la *destinazione*? (es. Relais dell’Ussero, Casa Monic, Belle Vue, ecc.)")
+                s["taxi_form"] = form
+                return str(tw)
+
+        # a questo punto abbiamo tutti i campi → calcolo tariffa
+        start = (form["from"] or "").lower()
+        end = (form["to"] or "").lower()
+        if "aeroporto" in start or "aeroporto" in end or "airport" in start or "airport" in end:
+            price = "50€"
+        else:
+            price = "40€"
+
+        summary = (
+            "Perfetto, riepilogo:\n"
+            f"• Persone: {form['people']}\n"
+            f"• Orario: {form['time']}\n"
+            f"• Partenza: {form['from']}\n"
+            f"• Destinazione: {form['to']}\n\n"
+            f"Tariffa: {price}.\n"
+            "Confermi che va bene? (sì/no)\n"
+            "Se confermi, Niccolò ti contatterà a breve per la conferma definitiva."
+        )
+        s["taxi_form"] = form
+        s["awaiting_taxi_confirm"] = True
+        tw = MessagingResponse()
+        tw.message(summary)
+        return str(tw)
+
+    # 3) Conferma taxi
+    if s.get("awaiting_taxi_confirm"):
+        if body.strip().lower() in ("si", "sì", "yes", "ok", "va bene", "confermo"):
+            s.pop("awaiting_taxi_confirm", None)
+            s["last_intent"] = None
+            tw = MessagingResponse()
+            tw.message("Perfetto 👍 Ho memorizzato la richiesta. Niccolò ti contatterà a breve per confermare il transfer.")
+            return str(tw)
+        elif body.strip().lower() in ("no", "annulla", "cancella"):
+            s.pop("awaiting_taxi_confirm", None)
+            s["last_intent"] = None
+            tw = MessagingResponse()
+            tw.message("Ok, richiesta annullata. Se ti serve altro sono qui.")
             return str(tw)
         else:
             tw = MessagingResponse()
-            tw.message("Non rilevo una prenotazione associata al tuo numero. Vuoi indicarmi il nome e cognome con cui hai prenotato per verificare?")
+            tw.message("Puoi dirmi *sì* per confermare o *no* per annullare?")
             return str(tw)
 
-    # Se chiede “come posso arrivare / taxi / transfer” gestiamo form taxi con tariffa corretta
-    if re.search(r"\btaxi\b|\btransfer\b|arrivar(e|ci) (all[a|o]|alla|al) (struttura|casa|relais|appartamento)|aeroporto", low):
-        # quick form: se possiamo capire già aeroporto/città
-        msg = []
-        # Se nel testo si cita aeroporto → tariffa 50€
-        if "aeroporto" in low:
-            msg.append("Transfer da/per aeroporto: 50€.")
+    # 4) Intent PARCHEGGIO (semplice instradamento: chiedi struttura se manca)
+    if s.get("last_intent") == "parking":
+        # Se l’utente non ha specificato la struttura, chiedila
+        if not s.get("structure"):
+            lower = body.lower()
+            known = {
+                "relais": "Relais dell’Ussero",
+                "ussero": "Relais dell’Ussero",
+                "monic": "Casa Monic",
+                "belle": "Belle Vue",
+                "vue": "Belle Vue",
+                "villino": "Villino di Monic",
+                "gina": "Casa di Gina",
+            }
+            chosen = None
+            for k, name in known.items():
+                if k in lower:
+                    chosen = name
+                    break
+            if not chosen:
+                tw = MessagingResponse()
+                tw.message("Per il parcheggio, in quale struttura stai alloggiando? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)")
+                return str(tw)
+            s["structure"] = chosen
+
+        # risposte parcheggio per struttura
+        struct = s["structure"]
+        if struct == "Casa Monic":
+            msg = "Casa Monic: parcheggio pubblico in *Piazza Carrara* o *Piazza Santa Caterina* (~400m), €1,50/h."
+        elif struct == "Belle Vue":
+            msg = ("Belle Vue: sotto al palazzo in *Via Antonio Rosmini* o in *Via Pasquale Galluppi* "
+                   "(a pagamento 08:00–14:00, poi gratis). Parcheggio custodito H24 in *Via Piave* (a pagamento).")
+        elif struct == "Relais dell’Ussero":
+            msg = "Relais dell’Ussero: parcheggio pubblico *Piazza Carrara* (pochi metri), €1,50/h."
+        elif struct == "Casa di Gina":
+            msg = ("Casa di Gina: *Via Crispi*, *Piazza Aurelio Saffi* o *Lungarno Sidney Sonnino*, "
+                   "€1,50/h.")
+        elif struct == "Villino di Monic":
+            msg = "Villino di Monic: posteggio privato *non* indicato in KB; ti metto in contatto con Niccolò."
         else:
-            msg.append("Transfer in città: 40€.")
-        msg.append("Per procedere mi servono: orario, numero di persone e destinazione (se non l’hai già indicata).")
-        tw = MessagingResponse(); tw.message("\n".join(msg))
+            msg = "Per questa struttura non ho indicazioni parcheggio in KB; ti metto in contatto con Niccolò."
+        tw = MessagingResponse()
+        tw.message(msg)
+        # chiudiamo intent
+        s["last_intent"] = None
         return str(tw)
 
-    # Parcheggio per struttura (se nota)
-    if "parchegg" in low:
-        prop = s.get("property") or infer_property_from_text(body)
-        if not prop:
-            tw = MessagingResponse()
-            tw.message("Per indicarti il parcheggio giusto, mi dici in quale struttura stai alloggiando? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)")
-            return str(tw)
-        # risponde con suggerimento sintetico dalla KB se presente
-        loc = KB.get("locations", {}).get(prop, {})
-        tip = ""
-        if "Relais dell’Ussero" == prop:
-            tip = "Parcheggio pubblico Piazza Carrara (1,50€/h), a pochi metri dal Relais."
-        elif "Casa Monic" == prop:
-            tip = "Piazza Carrara o Piazza Santa Caterina (pubblici, ~400m, 1,50€/h)."
-        elif "Belle Vue" == prop:
-            tip = "Sotto il palazzo in via Rosmini o in via Galluppi (a pagamento 08:00–14:00; dopo GRATIS). Custodito H24 in via Piave (a pagamento)."
-        elif "Casa di Gina" == prop:
-            tip = "Via Crispi, Piazza Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h)."
-        elif "Villino di Monic" == prop:
-            tip = "Posto auto privato incluso (se indicato in prenotazione); in alternativa strisce blu in zona."
-        if not tip:
-            tip = kb_property_summary(prop) or "Per il parcheggio ti do indicazioni precise appena so la struttura."
-        tw = MessagingResponse(); tw.message(tip)
-        return str(tw)
-
-    # Corrente / guasti → rispondi se KB specifica (es. Casa Monic), altrimenti passa contatto
-    if "corrente" in low or "luce" in low or "elettric" in low:
-        prop = s.get("property") or infer_property_from_text(body)
-        if prop == "Casa Monic":
-            msg = ("Se la corrente è andata via:\n"
-                   "• In cucina, a sinistra dell’ingresso, c’è la porta del quadro elettrico.\n"
-                   "• Se non torna, controlla il quadro generale accanto al portone verde (nelle cassette della posta). "
-                   "Apri con la chiave che trovi in casa, cerca il contatore 'COSCI LAURA' e alza la levetta.")
-            tw = MessagingResponse(); tw.message(msg)
-            return str(tw)
-        else:
-            tw = MessagingResponse(); tw.message("Per guasti o emergenze elettriche ti metto subito in contatto con Niccolò: +39 333 6011867.")
-            return str(tw)
-
-    # Se l’utente chiede genericamente info → usa GPT con prompt basato su KB + contesto prenotazione
-    system_prompt = build_system_prompt(s.get("property"), s.get("booking"))
-    ai = gpt_reply(system_prompt, body)
-
-    add_history(s, "assistant", ai)
-    tw = MessagingResponse(); tw.message(ai)
+    # 5) Altre richieste → fallback GPT
+    reply = gpt_reply(body, ctx)
+    tw = MessagingResponse()
+    tw.message(reply)
     return str(tw)
 
-# Gunicorn entrypoint expects "app"
+# ------------------------------------------------------------------------------
+# Avvio dev (su Render usi gunicorn)
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
