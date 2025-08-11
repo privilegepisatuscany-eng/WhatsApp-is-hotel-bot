@@ -1,367 +1,320 @@
-import os, re, json, logging, time
-from typing import Any, Dict, Optional
-from flask import Flask, request, Response, render_template, jsonify
+import os
+import json
+import logging
+from flask import Flask, request, render_template, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
-from openai import OpenAI
 
+from state import MemoryStore
+from nlp import detect_intent, normalize_sender, fmt_euro
 from ciao_booking_client import (
-    first_touch_ciaobooking_lookup,
-    get_reservation_by_id,
+    cb_login,
+    find_client_by_phone,
+    find_reservation_by_ref,
+)
+# Carica KB
+with open(os.path.join("kb", "knowledge_base.json"), "r", encoding="utf-8") as f:
+    KB = json.load(f)
+
+# Logging robusto: accetta "debug"/"INFO"/etc.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
+    LOG_LEVEL = "INFO"
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-if LOG_LEVEL not in ["CRITICAL","ERROR","WARNING","INFO","DEBUG","NOTSET"]:
-    LOG_LEVEL = "INFO"
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+app = Flask(__name__)
+state = MemoryStore()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Flask
-# ──────────────────────────────────────────────────────────────────────────────
-app = Flask(__name__, template_folder="templates", static_folder="static")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# OpenAI
-# ──────────────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-if not OPENAI_API_KEY:
-    logging.warning("OPENAI_API_KEY non impostata")
-client_ai = OpenAI(api_key=OPENAI_API_KEY)
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# In-memory session (per Render/PoC; in produzione usare Redis)
-# ──────────────────────────────────────────────────────────────────────────────
-SESS: Dict[str, Dict[str, Any]] = {}
-
-def get_session(sender: str) -> Dict[str, Any]:
-    s = SESS.setdefault(sender, {})
-    s.setdefault("created_at", time.time())
-    s.setdefault("flow", None)
-    s.setdefault("last_intent_corrente", False)
-    s.setdefault("history", [])
-    return s
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Knowledge base
-# ──────────────────────────────────────────────────────────────────────────────
-def load_kb() -> Dict[str, Any]:
-    try:
-        with open("knowledge_base.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logging.warning("Impossibile caricare knowledge_base.json: %s", e)
-        return {}
-
-KB: Dict[str, Any] = load_kb()
-
-FALLBACK_VIDEOS = {
-    "Relais dell’Ussero": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share",
-    "Casa Monic": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
-    "Belle Vue": "https://youtube.com/shorts/1iqknGhIFEc?feature=share",
-    "Casa di Gina": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share",
-    "Casa Monic (ripristino corrente)": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share",
-}
-
-def kb_get(path: str, default=None):
-    try:
-        cur = KB
-        for p in path.split("."):
-            if not isinstance(cur, dict) or p not in cur:
-                return default
-            cur = cur[p]
-        return cur
-    except Exception:
-        return default
-
-def kb_video_for(structure: str) -> Optional[str]:
-    videos = kb_get("videos", {}) or {}
-    if not videos:
-        videos = FALLBACK_VIDEOS
-
-    s = structure.lower().strip()
-    aliases = {
-        "relais": "Relais dell’Ussero",
-        "ussero": "Relais dell’Ussero",
-        "casa monic": "Casa Monic",
-        "casa di monic": "Casa Monic",
-        "monic": "Casa Monic",
-        "belle vue": "Belle Vue",
-        "rosmini": "Belle Vue",
-        "gina": "Casa di Gina",
-        "casa di gina": "Casa di Gina",
-        "villino": "Villino di Monic",
-        "villino di monic": "Villino di Monic",
-    }
-    target = aliases.get(s)
-    if not target:
-        for key in list(videos.keys()) + list(FALLBACK_VIDEOS.keys()):
-            if key.lower() in s or s in key.lower():
-                target = key
-                break
-    if not target:
-        target = structure
-    return videos.get(target) or FALLBACK_VIDEOS.get(target)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Utils
-# ──────────────────────────────────────────────────────────────────────────────
-def normalize_sender(raw: str) -> str:
-    # whatsapp:+39xxx or free text in tester
-    raw = raw.strip()
-    if raw.startswith("whatsapp:"):
-        raw = raw.split("whatsapp:")[-1]
-    raw = raw.replace("+", "").replace(" ", "")
-    return raw
-
-def twiml_message(text: str) -> str:
+# --- Helper risposta WhatsApp/Test ---
+def twiml(text):
     tw = MessagingResponse()
     tw.message(text)
     return str(tw)
 
-def ai_reply(system: str, user: str) -> str:
-    try:
-        resp = client_ai.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.3,
-            messages=[
-                {"role":"system","content":system},
-                {"role":"user","content":user}
-            ]
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error("AI error: %s", e)
-        return "Mi dispiace, c’è stato un problema temporaneo. Riprova tra poco."
+def answer_text(text):
+    # per /test_api (ritorna semplice stringa)
+    return text
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Intents & Flussi
-# ──────────────────────────────────────────────────────────────────────────────
-INTENT_TRANSFER = ["transfer","trasfer","taxi","trasporto","arrivare","aeroporto","stazione"]
-INTENT_PARCHEGGIO = ["parcheggio","parcheggiare"]
-INTENT_VIDEO = ["video","check-in","check in","istruzioni","come entrare","self check"]
-INTENT_CORRENTE = ["corrente","luce","blackout","saltata la corrente","ripristino"]
+# --- Intent Handlers ---
 
-def detect_intent(text: str) -> Optional[str]:
-    t = text.lower()
-    if any(w in t for w in INTENT_TRANSFER):   return "transfer"
-    if any(w in t for w in INTENT_PARCHEGGIO): return "parcheggio"
-    if any(w in t for w in INTENT_CORRENTE):   return "video"  # corrente è ramo speciale del video
-    if any(w in t for w in INTENT_VIDEO):      return "video"
-    return None
+def handle_greeting(ctx, kb):
+    """
+    Primo messaggio: se non abbiamo ancora il contesto CiaoBooking per il caller,
+    proviamo lookup automatico (in base al numero) UNA sola volta.
+    Poi chiediamo subito lo scopo (Taxi/Transfer, Parcheggio, Video/Accesso),
+    e SE non troviamo il cliente chiediamo nome o ref se serve.
+    """
+    greeting = "Ciao! Come posso aiutarti oggi?"
+    # Lookup automatico una volta per sessione
+    if not ctx.get("cb_checked"):
+        ctx["cb_checked"] = True
+        token = cb_login()
+        if token:
+            client = find_client_by_phone(ctx["phone"], token)
+            if client:
+                ctx["client"] = client
+                ctx["client_known"] = True
+                logging.info("CiaoBooking: client trovato")
+            else:
+                ctx["client_known"] = False
+                logging.info("CiaoBooking: client non trovato (%s)", ctx["phone"])
+        else:
+            logging.warning("CiaoBooking login fallito; procedo senza contesto")
+    # Prompt breve, niente reset conversazione
+    follow = "Posso aiutarti con *Taxi/Transfer*, *Parcheggio* o *Video/Accesso*."
+    # Se non riconosciuto il cliente, **non** chiediamo più numeri di telefono,
+    # ma se l’utente scrive esplicitamente “ho prenotazione” poi raccoglieremo ref nell’intent.
+    return f"{greeting}\n{follow}"
 
-def start_prompt():
-    return "Come posso aiutarti? *Taxi/Transfer*, *Parcheggio* oppure *Video/Info accesso*."
+def handle_transfer(ctx, kb, msg):
+    """
+    Flusso transfer: 2 regole semplici
+    - Se il testo indica aeroporto ↔ città, tariffa 50€.
+    - Altrimenti 40€.
+    Raccogliamo: persone, orario, partenza/destinazione (solo quelli mancanti).
+    Poi **chiediamo conferma tariffa** e chiudiamo.
+    """
+    form = ctx.setdefault("transfer_form", {"people": None, "time": None, "from": None, "to": None})
+    lower = msg.lower()
 
-# ── Transfer ──────────────────────────────────────────────────────────────────
-def compute_transfer_price(start: str, dest: str) -> str:
-    s = (start or "").lower()
-    d = (dest or "").lower()
-    airport_words = ["aeroporto","airport","galilei","pisa psa","psa"]
-    if any(w in s for w in airport_words) or any(w in d for w in airport_words):
-        return "50€"
-    return "40€"
+    # Pre‑estrazione semplice
+    import re
+    if form["people"] is None:
+        m = re.search(r"\b(\d+)\s*(persone|ospiti|pax)?\b", lower)
+        if m:
+            form["people"] = int(m.group(1))
+    if form["time"] is None:
+        m = re.search(r"\b(\d{1,2}[:\.]\d{2})\b", lower)
+        if m:
+            form["time"] = m.group(1).replace(".", ":")
 
-def transfer_step(body: str, sess: Dict[str, Any]) -> str:
-    # state machine semplice
-    data = sess.setdefault("transfer", {"persone": None, "orario": None, "partenza": None, "destinazione": None})
-    t = body.strip()
+    # Partenza/destinazione
+    if form["from"] is None:
+        if "aeroporto" in lower:
+            form["from"] = "Aeroporto"
+        elif "stazione" in lower:
+            form["from"] = "Stazione"
+    if form["to"] is None:
+        # nomi strutture note
+        for name in kb["structures"].keys():
+            if name.lower() in lower:
+                form["to"] = name
+                break
 
-    # estrazioni veloci
-    m_num = re.search(r"\b([0-9]{1,2})(?:\s*persone| pax|pers| ospiti)?\b", t.lower())
-    if m_num and not data["persone"]:
-        data["persone"] = m_num.group(1)
+    # Se l’utente ha scritto esplicitamente “dall’aeroporto a X”
+    if "dall'aeroporto" in lower or "dall aeroporto" in lower:
+        form["from"] = "Aeroporto"
+    if "allo" in lower or "a " in lower:
+        # già coperto sopra dal match struttura, lasciamo così per semplicità
+        pass
 
-    m_time = re.search(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b", t)
-    if m_time and not data["orario"]:
-        hh, mm = m_time.group(1), m_time.group(2)
-        data["orario"] = f"{int(hh):02d}:{mm}"
-
-    # heuristics start/dest
-    if any(k in t.lower() for k in ["aeroporto","airport","psa","galilei"]) and not data["partenza"]:
-        data["partenza"] = "Aeroporto"
-    if any(k in t.lower() for k in ["casa monic","casa di monic","monic"]) and not data["destinazione"]:
-        data["destinazione"] = "Casa Monic"
-    if any(k in t.lower() for k in ["belle vue","rosmini"]) and not data["destinazione"]:
-        data["destinazione"] = "Belle Vue"
-    if any(k in t.lower() for k in ["relais","ussero"]) and not data["destinazione"]:
-        data["destinazione"] = "Relais dell’Ussero"
-    if any(k in t.lower() for k in ["gina","casa di gina"]) and not data["destinazione"]:
-        data["destinazione"] = "Casa di Gina"
-    if any(k in t.lower() for k in ["villino"]) and not data["destinazione"]:
-        data["destinazione"] = "Villino di Monic"
-
-    # domande mancanti
-    if not data["persone"]:
-        return "Per il transfer, quante persone siete?"
-    if not data["orario"]:
+    # Chiedi solo i campi mancanti, con ordine smart
+    if form["people"] is None:
+        return "Quante persone siete per il transfer?"
+    if form["time"] is None:
         return "A che ora desideri la partenza?"
-    if not data["partenza"]:
-        return "Qual è il luogo di partenza?"
-    if not data["destinazione"]:
-        return "Qual è la destinazione?"
+    if form["from"] is None:
+        return "Da dove partite? (Aeroporto/Stazione/Altro)"
+    if form["to"] is None:
+        return "Qual è la destinazione? (puoi indicare la struttura)"
 
-    prezzo = compute_transfer_price(data["partenza"], data["destinazione"])
-    return (f"Perfetto! Riepilogo:\n"
-            f"• Persone: {data['persone']}\n"
-            f"• Orario: {data['orario']}\n"
-            f"• Partenza: {data['partenza']}\n"
-            f"• Destinazione: {data['destinazione']}\n\n"
-            f"Tariffa: {prezzo}.\n"
-            f"Confermi che la tariffa va bene? (sì/no)\n"
-            f"Poi Niccolò ti contatterà a breve per confermare.")
+    # Tutti i dati: calcolo tariffa
+    def is_airport_leg(a, b):
+        a = (a or "").lower()
+        b = (b or "").lower()
+        return "aeroporto" in a or "aeroporto" in b
 
-# ── Parcheggio (minimo, già presente) ────────────────────────────────────────
-def parcheggio_step(body: str, sess: Dict[str, Any]) -> str:
-    t = body.lower()
-    mapping = {
-        "relais": "Parcheggio pubblico Piazza Carrara (1,50€/h) a pochi metri dal Relais.",
-        "ussero": "Parcheggio pubblico Piazza Carrara (1,50€/h) a pochi metri dal Relais.",
-        "casa monic": "Piazza Carrara o Piazza Santa Caterina, circa 400m (1,50€/h).",
-        "casa di monic": "Piazza Carrara o Piazza Santa Caterina, circa 400m (1,50€/h).",
-        "monic": "Piazza Carrara o Piazza Santa Caterina, circa 400m (1,50€/h).",
-        "belle vue": "Sotto al palazzo in Via Antonio Rosmini o Via Pasquale Galluppi (08–14 a pagamento, poi gratis). Custodito H24 in Via Piave (a pagamento).",
-        "rosmini": "Sotto al palazzo in Via Antonio Rosmini o Via Pasquale Galluppi (08–14 a pagamento, poi gratis). Custodito H24 in Via Piave (a pagamento).",
-        "gina": "Via Crispi, Piazza Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h).",
-        "casa di gina": "Via Crispi, Piazza Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h).",
-        "villino": "Posteggio privato incluso presso il Villino di Monic.",
-        "villino di monic": "Posteggio privato incluso presso il Villino di Monic.",
-    }
-    for k, v in mapping.items():
-        if k in t:
-            return v + "\nHai bisogno di altro?"
-    return "Per aiutarti col parcheggio, dimmi in quale struttura ti trovi (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)."
+    price = 50 if is_airport_leg(form["from"], form["to"]) else 40
+    ctx["transfer_price"] = price
 
-# ── Video / Corrente ─────────────────────────────────────────────────────────
-def video_step(body: str, sess: Dict[str, Any]) -> str:
-    txt = body.lower().strip()
-    sess["last_topic"] = "video"
-    is_corrente = sess.get("last_intent_corrente", False) or any(k in txt for k in INTENT_CORRENTE)
+    summary = (
+        "Perfetto, ho raccolto questi dati:\n"
+        f"• Persone: {form['people']}\n"
+        f"• Orario: {form['time']}\n"
+        f"• Partenza: {form['from']}\n"
+        f"• Destinazione: {form['to']}\n\n"
+        f"Tariffa: {fmt_euro(price)}.\n"
+        "Confermi che la tariffa ti sta bene? (sì/no)"
+    )
+    ctx["pending"] = "transfer_confirm"
+    return summary
 
-    # Se ha detto "corrente" e ora invia la struttura
-    for name in ("relais","ussero","casa monic","casa di monic","monic","belle vue","gina","casa di gina","villino","villino di monic"):
-        if name in txt and is_corrente:
-            if "monic" in name and "villino" not in name:
-                instr = kb_get("emergenze.casa_monic_corrente", "")
-                if not instr:
-                    instr = ("Per il ripristino della corrente a Casa Monic: apri la porta in cucina e verifica il quadro elettrico. "
-                             "Se non basta, controlla il quadro generale accanto al portone verde (armadio cassette della posta) e riporta su la leva del contatore con la scritta COSCI.")
-                vid = FALLBACK_VIDEOS.get("Casa Monic (ripristino corrente)")
-                sess["last_intent_corrente"] = False
-                return f"{instr}\nVideo: {vid}\nServe altro? Posso aiutarti anche con *Parcheggio* o *Transfer*."
-            sess["last_intent_corrente"] = False
-            return "Per questa struttura non ho una procedura corrente dedicata. Ti serve il video di self check‑in?"
+def handle_transfer_confirm(ctx, msg):
+    if msg.strip().lower() in ("si", "sì", "ok", "va bene", "confermo"):
+        ctx.pop("pending", None)
+        return "👍 Perfetto, ho memorizzato la conferma. Niccolò ti contatterà a breve per i dettagli finali."
+    elif msg.strip().lower() in ("no", "non va bene"):
+        ctx.pop("pending", None)
+        return "Ok, allora non procedo. Se vuoi modificare orario o tratta, dimmelo pure."
+    else:
+        return "Per favore rispondi *sì* o *no* alla conferma della tariffa."
 
-    # Self check‑in video standard
-    aliases = {
-        "relais":"Relais dell’Ussero","ussero":"Relais dell’Ussero",
-        "casa monic":"Casa Monic","casa di monic":"Casa Monic","monic":"Casa Monic",
-        "belle vue":"Belle Vue","rosmini":"Belle Vue",
-        "gina":"Casa di Gina","casa di gina":"Casa di Gina",
-        "villino":"Villino di Monic","villino di monic":"Villino di Monic"
-    }
-    for k, pretty in aliases.items():
-        if k in txt:
-            url = kb_video_for(pretty)
-            sess["last_intent_corrente"] = False
-            if url:
-                return f"Ecco il video di self check‑in per *{pretty}*: {url}\nHai bisogno di altro?"
-            return "Per questa struttura non ho un video associato. Ti serve altro?"
+def handle_parking(ctx, kb, msg):
+    """
+    Parcheggio: chiedi la struttura se non nota; poi rispondi solo con quelle info.
+    """
+    structure = ctx.get("structure")
+    if not structure:
+        # Prova estrazione rapida dal messaggio
+        for name in kb["structures"].keys():
+            if name.lower() in msg.lower():
+                structure = name
+                ctx["structure"] = name
+                break
+    if not structure:
+        # chiedi
+        names = ", ".join(kb["structures"].keys())
+        return f"Per il parcheggio, in quale struttura ti trovi? ({names})"
 
-    # Non capito: chiedi struttura
-    if is_corrente:
-        return ("Per la *corrente*, indicami la struttura (es. Casa Monic) così ti mando la procedura corretta.\n"
-                "Oppure scrivi *corrente Casa Monic*.")
-    return ("Hai bisogno del *video di self check‑in*? Dimmi la struttura:\n"
-            "- Relais dell’Ussero\n- Casa Monic\n- Belle Vue\n- Villino di Monic\n- Casa di Gina")
+    info = kb["structures"].get(structure, {})
+    parking = info.get("parking")
+    if not parking:
+        return "Per questa struttura non ho dettagli di parcheggio aggiornati. Ti farò contattare da Niccolò."
+    return parking
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Web
-# ──────────────────────────────────────────────────────────────────────────────
+def handle_videos(ctx, kb, msg):
+    """
+    Mostra solo i video pertinenti alla struttura richiesta (o chiedi la struttura).
+    Include video check-in e video ripristino corrente se presenti.
+    """
+    structure = ctx.get("structure")
+    for name in kb["structures"].keys():
+        if name.lower() in msg.lower():
+            structure = name
+            ctx["structure"] = name
+            break
+
+    if not structure:
+        names = ", ".join(kb["structures"].keys())
+        return f"Per i video, dimmi la struttura: ({names})"
+
+    s = kb["structures"].get(structure, {})
+    vids = s.get("videos", {})
+    chunks = []
+    if vids.get("checkin"):
+        chunks.append(f"🎥 Video check‑in: {vids['checkin']}")
+    if vids.get("power"):
+        chunks.append(f"🔌 Ripristino corrente: {vids['power']}")
+    if not chunks:
+        return "Per questa struttura non ho video associati al momento."
+    return "\n".join(chunks)
+
+def handle_power(ctx, kb, msg):
+    """
+    Se chiede corrente, prova a legare alla struttura.
+    Se è Casa Monic, inserisci anche il video.
+    """
+    structure = ctx.get("structure")
+    for name in kb["structures"].keys():
+        if name.lower() in msg.lower():
+            structure = name
+            ctx["structure"] = name
+            break
+
+    if not structure:
+        names = ", ".join(kb["structures"].keys())
+        return f"Per aiutarti sul ripristino corrente, dimmi la struttura: ({names})"
+
+    s = kb["structures"].get(structure, {})
+    tips = s.get("power_tips")
+    video = s.get("videos", {}).get("power")
+    if tips and video:
+        return f"{tips}\n\n🎥 Video: {video}"
+    if tips:
+        return tips
+    return "Per questa struttura non ho istruzioni sul ripristino corrente. Ti faccio contattare da Niccolò."
+
+# --- Router principale ---
+def route_message(ctx, kb, msg):
+    # Pending step? (es. conferma transfer)
+    if ctx.get("pending") == "transfer_confirm":
+        return handle_transfer_confirm(ctx, msg)
+
+    intent = detect_intent(msg)
+
+    if intent == "transfer":
+        ctx["last_intent"] = "transfer"
+        return handle_transfer(ctx, kb, msg)
+
+    if intent == "parking":
+        ctx["last_intent"] = "parking"
+        return handle_parking(ctx, kb, msg)
+
+    if intent == "video":
+        ctx["last_intent"] = "video"
+        return handle_videos(ctx, kb, msg)
+
+    if intent == "power":
+        ctx["last_intent"] = "power"
+        return handle_power(ctx, kb, msg)
+
+    # Se riconosce un numero prenotazione, prova lookup (non obbligatorio per transfer/taxi)
+    import re
+    m = re.search(r"\b(\d{6,})\b", msg)
+    if m:
+        token = cb_login()
+        if token:
+            res = find_reservation_by_ref(m.group(1), token)
+            if res:
+                ctx["reservation_ref"] = m.group(1)
+                # Se la prenotazione ha unit/property note, puoi salvarle in ctx["structure"] se mappabili
+                return "Ok, ho collegato la tua prenotazione. Come posso aiutarti? *Taxi/Transfer*, *Parcheggio* o *Video/Accesso*."
+        # se non trovata, non bloccare: si continua normalmente
+
+    # fallback: greeting
+    return handle_greeting(ctx, kb)
+
+# --- Flask routes ---
+
 @app.route("/", methods=["GET"])
-def health():
+def root():
     return "OK"
-
-@app.route("/test", methods=["GET"])
-def test_page():
-    return render_template("test.html")
-
-@app.route("/test_api", methods=["POST"])
-def test_api():
-    # Simula Twilio
-    body = (request.form.get("Body") or "").strip()
-    sender_raw = (request.form.get("From") or "").strip()
-    if not sender_raw:
-        # opzionale: consenti passaggio numero a mano
-        sender_raw = request.form.get("Phone") or ""
-    sender = normalize_sender(sender_raw)
-    return _handle_message(sender, body)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     sender_raw = request.form.get("From", "")
     body = (request.form.get("Body") or "").strip()
     sender = normalize_sender(sender_raw)
-    return _handle_message(sender, body)
-
-def _handle_message(sender: str, body: str):
     logging.debug("Inbound da %s: %s", sender, body)
-    sess = get_session(sender)
 
-    # First-touch: lookup CiaoBooking per il numero (cache in sessione)
-    if not sess.get("ciaobooking_checked"):
-        try:
-            first_touch_ciaobooking_lookup(sender, sess)
-        except Exception as e:
-            logging.error("Errore lookup CiaoBooking: %s", e)
-        finally:
-            sess["ciaobooking_checked"] = True
+    # stato conversazione
+    ctx = state.get(sender)
+    if not ctx:
+        ctx = {"phone": sender.replace("whatsapp:", "").replace("+", "").strip()}
+        state.set(sender, ctx)
 
-    # Se il messaggio contiene “prenotazione …<numero>”
-    if re.search(r"\b(prenotazione|reservation|res)\b", body.lower()):
-        rid = re.findall(r"\b(\d{6,})\b", body)
-        if rid:
-            res = get_reservation_by_id(rid[0])
-            if res:
-                sess["reservation"] = res
-                return Response(twiml_message("Ho trovato la tua prenotazione, grazie. Come posso aiutarti? *Taxi/Transfer*, *Parcheggio* o *Video/Info accesso*?"), mimetype="application/xml")
+    reply = route_message(ctx, KB, body)
 
-    # Se l’utente invia SOLO un numero lungo → provalo come reservation id
-    if re.fullmatch(r"\d{6,}", body):
-        res = get_reservation_by_id(body)
-        if res:
-            sess["reservation"] = res
-            return Response(twiml_message("Ho trovato la tua prenotazione, grazie. Come posso aiutarti? *Taxi/Transfer*, *Parcheggio* o *Video/Info accesso*?"), mimetype="application/xml")
+    # Se la richiesta arriva da Twilio, rispondiamo con TwiML
+    if "whatsapp:" in sender_raw or request.form.get("MessageSid"):
+        return twiml(reply)
+    # Per sicurezza (non dovrebbe capitare)
+    return reply
 
-    # Intent routing
-    intent = detect_intent(body)
-    if intent == "transfer":
-        sess["flow"] = "transfer"
-        sess["last_intent_corrente"] = False
-        msg = transfer_step(body, sess)
-        return Response(twiml_message(msg), mimetype="application/xml")
-    if intent == "parcheggio":
-        sess["flow"] = "parcheggio"
-        sess["last_intent_corrente"] = False
-        return Response(twiml_message(parcheggio_step(body, sess)), mimetype="application/xml")
-    if intent == "video":
-        sess["flow"] = "video"
-        sess["last_intent_corrente"] = any(k in body.lower() for k in INTENT_CORRENTE) or sess.get("last_intent_corrente", False)
-        return Response(twiml_message(video_step(body, sess)), mimetype="application/xml")
+# --- Test UI ---
+@app.route("/test", methods=["GET"])
+def test_page():
+    return render_template("test.html")
 
-    # Se siamo già in un flow, prova a far avanzare
-    flow = sess.get("flow")
-    if flow == "transfer":
-        return Response(twiml_message(transfer_step(body, sess)), mimetype="application/xml")
-    if flow == "parcheggio":
-        return Response(twiml_message(parcheggio_step(body, sess)), mimetype="application/xml")
-    if flow == "video":
-        return Response(twiml_message(video_step(body, sess)), mimetype="application/xml")
+@app.route("/test_api", methods=["POST"])
+def test_api():
+    data = request.get_json(force=True, silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    message = (data.get("message") or "").strip()
+    if not phone or not message:
+        return jsonify({"ok": False, "reply": "Telefono e messaggio sono obbligatori"}), 400
 
-    # Altrimenti prompt iniziale
-    return Response(twiml_message(start_prompt()), mimetype="application/xml")
+    sender = phone
+    ctx = state.get(sender)
+    if not ctx:
+        ctx = {"phone": phone}
+        state.set(sender, ctx)
+
+    reply = route_message(ctx, KB, message)
+    return jsonify({"ok": True, "reply": reply})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
