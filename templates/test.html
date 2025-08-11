@@ -2,99 +2,104 @@
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tester Bot – WhatsApp-like</title>
+  <title>Test Bot</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    :root { --bg:#0b141a; --panel:#111b21; --bubble:#202c33; --me:#005c4b; --text:#e9edef; --muted:#94a3b8; --accent:#25d366;}
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-    header{padding:14px 18px;background:var(--panel);border-bottom:1px solid #22303a;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:2}
-    header .left{display:flex;gap:10px;align-items:center}
-    header input[type="tel"]{background:#0e171c;border:1px solid #22303a;color:var(--text);padding:8px 10px;border-radius:8px;width:260px}
-    header button{background:transparent;border:1px solid #2a3b47;color:var(--muted);border-radius:8px;padding:8px 10px;cursor:pointer}
-    header button:hover{border-color:#3b4f5e;color:#cbd5e1}
-    main{max-width:960px;margin:0 auto;padding:18px}
-    .chat{background:var(--panel);border:1px solid #22303a;border-radius:14px;height:70vh;overflow:auto;padding:18px;scroll-behavior:smooth}
-    .row{display:flex;margin:10px 0}.row.me{justify-content:flex-end}
-    .bubble{max-width:70%;background:var(--bubble);padding:10px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word}
-    .me .bubble{background:var(--me)}
-    .sys{text-align:center;color:var(--muted);font-size:12px;margin:12px 0}
-    form.send{display:flex;gap:10px;margin-top:12px}
-    form.send textarea{flex:1;background:var(--panel);border:1px solid #22303a;color:var(--text);resize:none;padding:10px 12px;border-radius:10px;height:60px}
-    form.send button{background:var(--accent);color:#06351d;border:0;border-radius:10px;padding:0 16px;font-weight:600;cursor:pointer}
-    .hint{color:var(--muted);font-size:12px;margin-top:4px}
-    code{color:#cbd5e1}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#f7f7f8;color:#111}
+    .wrap{max-width:780px;margin:24px auto;padding:16px}
+    .row{display:flex;gap:8px;margin-bottom:8px}
+    input,button,textarea{font:inherit}
+    input,textarea{padding:10px;border:1px solid #ddd;border-radius:8px;flex:1;background:#fff}
+    button{padding:10px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+    .chat{background:#fff;border:1px solid #eee;border-radius:12px; padding:10px 12px; height:420px; overflow:auto}
+    .msg{margin:8px 0;display:flex}
+    .me{justify-content:flex-end}
+    .me .bubble{background:#e8f0ff;color:#0a1b4d}
+    .bot .bubble{background:#f0f0f0}
+    .bubble{max-width:70%;padding:10px 12px;border-radius:12px}
+    .small{font-size:12px;color:#666;margin-top:2px}
   </style>
 </head>
 <body>
-  <header>
-    <div class="left">
-      <strong>Tester Bot</strong>
-      <input id="fromInput" type="tel" placeholder="Numero mittente (es. whatsapp:+39347...)" />
-      <button id="saveFrom">Salva numero</button>
-    </div>
-    <div class="right">
+  <div class="wrap">
+    <h2>Tester Bot</h2>
+    <div class="row">
+      <input id="phone" placeholder="Telefono (es: 3934...)" />
+      <button id="set">Usa numero</button>
       <button id="reset">Reset conversazione</button>
     </div>
-  </header>
-
-  <main>
-    <div id="chat" class="chat" aria-live="polite"></div>
-    <form id="sendForm" class="send">
-      <textarea id="msg" placeholder="Scrivi un messaggio... (INVIO per inviare)"></textarea>
-      <button type="submit">Invia</button>
-    </form>
-    <div class="hint">Invia richieste al tuo /webhook con i campi <code>From</code> e <code>Body</code> (form‑urlencoded).</div>
-  </main>
+    <div class="chat" id="chat"></div>
+    <div class="row">
+      <input id="msg" placeholder="Scrivi un messaggio..." />
+      <button id="send">Invia</button>
+    </div>
+    <div class="small">NB: questa pagina invia al backend su <code>/test_api</code> simulando Twilio.</div>
+  </div>
 
   <script>
-    const chatEl = document.getElementById('chat');
-    const formEl = document.getElementById('sendForm');
-    const msgEl = document.getElementById('msg');
-    const fromEl = document.getElementById('fromInput');
+    const chat = document.getElementById('chat');
+    const msg = document.getElementById('msg');
+    const phone = document.getElementById('phone');
+    let currentPhone = localStorage.getItem('tester_phone') || '';
 
-    function appendBubble(text, who='bot'){
-      if(!text) return;
-      const row=document.createElement('div'); row.className='row ' + (who==='me'?'me':'bot');
-      const b=document.createElement('div'); b.className='bubble'; b.textContent=text;
-      row.appendChild(b); chatEl.appendChild(row); chatEl.scrollTop=chatEl.scrollHeight;
-    }
-    function appendSys(t){ const n=document.createElement('div'); n.className='sys'; n.textContent=t; chatEl.appendChild(n); chatEl.scrollTop=chatEl.scrollHeight; }
-
-    function loadFrom(){ const v=localStorage.getItem('tester_from')||'whatsapp:+390000000000'; fromEl.value=v; }
-    function saveFrom(){ const v=(fromEl.value||'').trim(); if(!v) return; localStorage.setItem('tester_from',v); appendSys('Numero salvato: '+v); }
-
-    function parseTwimlMessage(x){
-      const m=x.match(/<Message[^>]*>([\s\S]*?)<\/Message>/i);
-      if(!m) return x;
-      return m[1].replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&').trim();
+    function add(role, text){
+      const line = document.createElement('div');
+      line.className = 'msg ' + (role === 'me' ? 'me' : 'bot');
+      const b = document.createElement('div');
+      b.className = 'bubble';
+      b.textContent = text;
+      line.appendChild(b);
+      chat.appendChild(line);
+      chat.scrollTop = chat.scrollHeight;
     }
 
-    document.getElementById('saveFrom').addEventListener('click', saveFrom);
-    document.getElementById('reset').addEventListener('click', async ()=>{
-      chatEl.innerHTML=''; appendSys('Conversazione resettata.');
-      await sendToWebhook('/reset');
-    });
-
-    formEl.addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const body=(msgEl.value||'').trim(); if(!body) return; msgEl.value='';
-      appendBubble(body,'me'); await sendToWebhook(body);
-    });
-
-    msgEl.addEventListener('keydown', (e)=>{
-      if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); formEl.dispatchEvent(new Event('submit')); }
-    });
-
-    async function sendToWebhook(bodyText){
-      const From=(fromEl.value||'').trim(); if(!From){ appendSys('Inserisci il numero mittente.'); return; }
-      try{
-        const data=new URLSearchParams(); data.append('From',From); data.append('Body',bodyText);
-        const res=await fetch('/webhook',{ method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data.toString() });
-        const twiml=await res.text(); const bot=parseTwimlMessage(twiml); appendBubble(bot,'bot');
-      }catch(err){ console.error(err); appendSys('Errore: '+(err?.message||'richiesta fallita')); }
+    function loadHistory(){
+      const h = JSON.parse(localStorage.getItem('history_'+currentPhone) || '[]');
+      chat.innerHTML = '';
+      h.forEach(x => add(x.role,x.text));
+    }
+    function pushHistory(role, text){
+      const k = 'history_'+currentPhone;
+      const h = JSON.parse(localStorage.getItem(k) || '[]');
+      h.push({role,text});
+      localStorage.setItem(k, JSON.stringify(h));
     }
 
-    loadFrom(); appendSys('Tester pronto. Inserisci/Salva il numero, poi invia un messaggio.');
+    document.getElementById('set').onclick = ()=>{
+      if(!phone.value.trim()) return alert('Inserisci un numero');
+      currentPhone = phone.value.trim();
+      localStorage.setItem('tester_phone', currentPhone);
+      loadHistory();
+    };
+
+    document.getElementById('reset').onclick = ()=>{
+      if(!currentPhone) return alert('Imposta prima un numero');
+      localStorage.removeItem('history_'+currentPhone);
+      chat.innerHTML = '';
+      add('bot','✅ Conversazione resettata. Scrivi un messaggio.');
+    };
+
+    document.getElementById('send').onclick = async ()=>{
+      if(!currentPhone) return alert('Imposta prima un numero');
+      if(!msg.value.trim()) return;
+      const text = msg.value;
+      msg.value = '';
+      add('me', text);
+      pushHistory('me', text);
+
+      const fd = new FormData();
+      fd.append('Phone', currentPhone);
+      fd.append('Body', text);
+      const r = await fetch('/test_api', {method:'POST', body:fd});
+      const t = await r.text();
+      const m = t.match(/<Message>([\s\S]*?)<\/Message>/i);
+      const reply = m ? m[1] : '(nessuna risposta)';
+      add('bot', reply);
+      pushHistory('bot', reply);
+    };
+
+    // init
+    if(currentPhone){ phone.value = currentPhone; loadHistory(); }
   </script>
 </body>
 </html>
