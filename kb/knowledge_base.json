@@ -1,60 +1,48 @@
 {
-  "addresses": {
-    "Relais dell’Ussero": "Lungarno Sonnino 42, Pisa",
-    "Casa Monic": "Via San Martino 85, Pisa",
-    "Belle Vue": "Via del Borghetto 54, Pisa",
-    "Villino di Monic": "Via Delle Belle Torri 50, Pisa",
-    "Casa di Gina": "Via Giuseppe Montanelli 33, Pisa"
-  },
-  "checkin": {
-    "orari": { "checkin": "dalle 15:00 alle 04:00", "checkout": "entro le 10:00" },
-    "nota_bagagli": "Se la struttura non è pronta all’arrivo, è possibile lasciare i bagagli all’interno in attesa della pulizia."
-  },
-  "videos": {
-    "Corrente - Casa Monic": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share",
-    "Check-in - Belle Vue": "https://youtube.com/shorts/1iqknGhIFEc?feature=share",
-    "Check-in - Casa di Gina": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share",
-    "Check-in - Casa Monic": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
-    "Check-in - Relais dell’Ussero": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share"
+  "transfer": {
+    "price_airport_city": "50€",
+    "price_city_city": "40€",
+    "payment": "contanti o carta",
+    "required_fields": ["persone", "orario", "partenza", "destinazione"]
   },
   "parking": {
-    "Relais dell’Ussero": "Parcheggio pubblico Piazza Carrara (1,50€/h), pochi metri dal relais.",
-    "Casa Monic": "Piazza Carrara o Piazza Santa Caterina, entrambi a circa 400m (1,50€/h).",
-    "Belle Vue": "Sotto al palazzo in via Antonio Rosmini o in via Pasquale Galluppi (a pagamento 08:00–14:00, poi gratis). Custodito H24 in via Piave (a pagamento).",
-    "Villino di Monic": "Di fronte in via Vincenzo Gioberti (strisce blu) o in via del Bastione (a pagamento 08:00–14:00, poi gratis).",
-    "Casa di Gina": "Via Crispi, Piazza Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h)."
+    "Relais dell’Ussero": "Parcheggio pubblico Piazza Carrara (1,50€/h) a pochi metri.",
+    "Casa Monic": "P.za Carrara o P.za Santa Caterina (pubblici), ~400m, 1,50€/h.",
+    "Belle Vue": "Sotto al palazzo in Via A. Rosmini o Via P. Galluppi (08–14 pagamento, poi gratis). Custodito H24 a pagamento in Via Piave.",
+    "Villino di Monic": "Parcheggio privato incluso.",
+    "Casa di Gina": "Via Crispi, P.za Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h)."
   },
-  "transfer": {
-    "tariffe": {
-      "aeroporto_citta": 50,
-      "citta_citta": 40
+  "videos": {
+    "Relais dell’Ussero": {
+      "checkin": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share"
     },
-    "richiesti": "Nome, numero persone, orario, partenza, destinazione. Metodo pagamento: indifferente.",
-    "note": "All’arrivo in aeroporto l’autista attende con cartello nome."
-  },
-  "emergency": {
-    "numeri": {
-      "Vigili del Fuoco": "115",
-      "Ambulanza": "118",
-      "Polizia": "113"
+    "Casa Monic": {
+      "checkin": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
+      "corrente": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share"
     },
-    "host": {
-      "Monica": "+39 351 8143662",
-      "Niccolò": "+39 333 6011867"
+    "Belle Vue": {
+      "checkin": "https://youtube.com/shorts/1iqknGhIFEc?feature=share"
     },
-    "corrente_casa_monic": "Quadro in cucina (porta a sinistra entrando). Se non basta, quadro generale accanto al portone verde nelle cassette della posta: contatore COSCI – solleva la leva."
+    "Casa di Gina": {
+      "checkin": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share"
+    }
   },
-  "rules": {
-    "generali": [
-      "Vietato fumare in casa e spazi comuni.",
-      "Silenzio 23:00–09:00 e 14:00–16:00.",
-      "Spegnere luci/TV/impianti quando si esce.",
-      "Non lasciare chiave inserita nel portone; riconsegnare le chiavi a fine soggiorno.",
-      "Perdita/rottura chiavi: penale 20€."
-    ]
+  "power": {
+    "Casa Monic": "Se salta la corrente: in cucina (a sinistra) c’è il quadro elettrico. Se non basta, controlla il quadro generale accanto al portone verde (armadio cassette posta), contatore con nome COSCI: solleva la leva.",
+    "Relais dell’Ussero": "Se manca, avvisa subito Niccolò; non forzare ascensore.",
+    "Belle Vue": "Controlla magnetotermici in casa; se persiste, contatta host.",
+    "Casa di Gina": "Controlla quadro in ingresso; se persiste, contatta host.",
+    "Villino di Monic": "Controlla quadro interno; se persiste, contatta host."
   },
-  "breakfast": {
-    "info": "Colazione: mar-dom 07:00–12:00 al Caffè dell’Ussero; lunedì 07:00–12:00 Pasticceria Macchi. Ticket in camera."
+  "hours": {
+    "checkin": "15:00 - 04:00",
+    "checkout": "10:00"
   },
-  "wifi_hint": "SSID e password sono esposti all’interno delle strutture (cartello/QR)."
+  "contacts": {
+    "monica": "+39 351 8143662",
+    "niccolo": "+39 333 6011867",
+    "instagram": "@privilege_pisa",
+    "site": "www.privilegepisatuscany.com",
+    "email": "privilegepisatuscany@gmail.com"
+  }
 }
