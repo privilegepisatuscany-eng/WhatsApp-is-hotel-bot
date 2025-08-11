@@ -1,71 +1,93 @@
-import os, logging, time, requests
-from typing import Dict, Any, Optional
+import os
+import time
+import logging
+import requests
 
-BASE_URL = "https://api.ciaobooking.com"
+BASE = os.environ.get("CIAOBOOKING_BASE", "https://api.ciaobooking.com")
 EMAIL = os.environ.get("CIAOBOOKING_EMAIL", "")
 PASSWORD = os.environ.get("CIAOBOOKING_PASSWORD", "")
-LOCALE = os.environ.get("CIAOBOOKING_LOCALE", "it")
+SOURCE = os.environ.get("CIAOBOOKING_SOURCE", "bot")
 
-_session: Dict[str, Any] = {"token": None, "exp": 0}
+_session = requests.Session()
+_token_cache = {"token": None, "exp": 0}
 
-def _login_if_needed():
+def cb_login():
     now = int(time.time())
-    if _session["token"] and _session["exp"] > now + 60:
-        return
-    url = f"{BASE_URL}/api/public/login"
-    resp = requests.post(url, data={"email": EMAIL, "password": PASSWORD, "source": "bot"}, headers={"Accept-Language": LOCALE}, timeout=8)
-    resp.raise_for_status()
-    data = resp.json()["data"]
-    _session["token"] = data["token"]
-    _session["exp"] = data["expiresAt"]
-    logging.info("CiaoBooking login OK; token valid until %s", _session["exp"])
+    if _token_cache["token"] and _token_cache["exp"] - now > 60:
+        return _token_cache["token"]
+    try:
+        r = _session.post(
+            f"{BASE}/api/public/login",
+            files={
+                "email": (None, EMAIL),
+                "password": (None, PASSWORD),
+                "source": (None, SOURCE),
+            },
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        token = data.get("token")
+        exp = data.get("expiresAt", now + 3600)
+        if token:
+            _token_cache["token"] = token
+            _token_cache["exp"] = exp
+            logging.info("CiaoBooking login OK; token valid until %s", exp)
+            return token
+    except requests.RequestException as e:
+        logging.error("CiaoBooking login error: %s", e)
+    return None
 
-def _headers():
-    _login_if_needed()
-    return {
-        "Authorization": f"Bearer {_session['token']}",
-        "Accept-Language": LOCALE,
-        "Content-Type": "application/json",
-    }
+def _auth_headers(token):
+    return {"Authorization": f"Bearer {token}"}
 
-def first_touch_ciaobooking_lookup(phone_normalized: str, sess: Dict[str, Any]):
+def find_client_by_phone(phone: str, token: str):
     """
-    Prova a trovare il client per numero di telefono (GET paginated con search)
-    e salva un contesto minimale in sessione.
+    GET /api/public/clients/paginated?search=<phone_normalized>
+    phone_normalized deve essere senza + e spazi
     """
     try:
-        url = f"{BASE_URL}/api/public/clients/paginated"
+        normalized = phone.replace("+", "").replace("whatsapp:", "").strip()
         params = {
             "limit": "5",
             "page": "1",
-            "search": phone_normalized,
+            "search": normalized,
             "order": "asc",
-            "sortBy[]": "name"
+            "sortBy[]": "name",
         }
-        r = requests.get(url, headers=_headers(), params=params, timeout=8)
-        if r.status_code >= 400:
-            logging.error("CiaoBooking error: %s", r.text)
-            r.raise_for_status()
-        data = r.json().get("data", {}).get("collection", [])
-        if not data:
-            logging.info("CiaoBooking: client non trovato (%s)", phone_normalized)
-            sess["ciaobooking_client"] = None
-        else:
-            sess["ciaobooking_client"] = data[0]
-            logging.info("CiaoBooking: client trovato id=%s", data[0].get("id"))
-    except Exception as e:
-        logging.error("Errore lookup CiaoBooking: %s", e)
-        sess["ciaobooking_client"] = None
+        r = _session.get(
+            f"{BASE}/api/public/clients/paginated",
+            headers=_auth_headers(token),
+            params=params,
+            timeout=5,
+        )
+        r.raise_for_status()
+        col = (r.json().get("data") or {}).get("collection") or []
+        return col[0] if col else None
+    except requests.HTTPError as he:
+        try:
+            j = he.response.json()
+            logging.error("CiaoBooking error: %s", j)
+        except Exception:
+            logging.error("CiaoBooking error: %s", he)
+        return None
+    except requests.RequestException as e:
+        logging.error("CiaoBooking request error: %s", e)
+        return None
 
-def get_reservation_by_id(res_id: str) -> Optional[Dict[str, Any]]:
+def find_reservation_by_ref(ref: str, token: str):
+    """ GET /api/public/reservations/{id} """
     try:
-        url = f"{BASE_URL}/api/public/reservations/{res_id}"
-        r = requests.get(url, headers=_headers(), timeout=8)
+        r = _session.get(
+            f"{BASE}/api/public/reservations/{ref}",
+            headers=_auth_headers(token),
+            timeout=5,
+        )
         if r.status_code == 404:
             logging.error("CiaoBooking reservation error: %s", r.text)
             return None
         r.raise_for_status()
-        return r.json().get("data", {})
-    except Exception as e:
-        logging.error("Errore reservation CiaoBooking: %s", e)
+        return (r.json() or {}).get("data")
+    except requests.RequestException as e:
+        logging.error("CiaoBooking reservation request error: %s", e)
         return None
