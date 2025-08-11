@@ -340,9 +340,47 @@ def webhook():
     tw.message(reply)
     return str(tw)
 
-# ------------------------------------------------------------------------------
-# Avvio dev (su Render usi gunicorn)
-# ------------------------------------------------------------------------------
+from flask import Flask, request, jsonify, send_from_directory
+import logging
+import os
+# ... altri import esistenti
+
+app = Flask(__name__)
+
+# --- configurazioni logging e variabili ---
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+
+# --- eventuali funzioni di supporto ---
+# def get_session(...):
+# def ensure_booking_context(...):
+# ecc...
+
+# --- qui ci sono già le tue rotte WhatsApp /webhook ---
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    # logica esistente per messaggi da Twilio
+    pass
+
+# --- QUI AGGIUNGI LE DUE NUOVE ROTTE ---
+@app.route("/test")
+def test_page():
+    return send_from_directory(".", "test_client.html")
+
+@app.route("/test_api", methods=["POST"])
+def test_api():
+    data = request.get_json(force=True)
+    sender = data.get("sender", "test")
+    body = data.get("message", "").strip()
+
+    s = get_session(sender)
+    ctx = ensure_booking_context(sender)
+    last_intent = s.get("last_intent")
+
+    # Qui puoi richiamare la stessa logica di webhook() o fare un reply diretto
+    reply = gpt_reply(body, ctx)
+    return jsonify({"reply": reply})
+
+# --- avvio applicazione ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
