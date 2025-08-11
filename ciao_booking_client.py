@@ -1,75 +1,102 @@
-
-import os
 import time
+import json
 import logging
 import requests
 
-BASE_URL = os.environ.get("CIAOBOOKING_BASE_URL", "https://api.ciaobooking.com")
-EMAIL = os.environ.get("CIAOBOOKING_EMAIL", "")
-PASSWORD = os.environ.get("CIAOBOOKING_PASSWORD", "")
-SOURCE = os.environ.get("CIAOBOOKING_SOURCE", "bot")
+class CiaoBookingClient:
+    def __init__(self, base_url, static_token=None, email=None, password=None, source="whatsapp-bot", locale="it"):
+        self.base_url = base_url.rstrip("/")
+        self.static_token = static_token
+        self.email = email
+        self.password = password
+        self.source = source
+        self.locale = locale
 
-_token = None
-_token_exp = 0
+        self._token = None
+        self._token_exp = 0
 
-def _login():
-    global _token, _token_exp
-    if not EMAIL or not PASSWORD:
-        logging.info("CiaoBooking login skipped: credentials not set")
-        return False
-    if _token and _token_exp > time.time() + 60:
-        return True
-    url = f"{BASE_URL}/api/public/login"
-    try:
-        r = requests.post(url, files={
-            "email": (None, EMAIL),
-            "password": (None, PASSWORD),
-            "source": (None, SOURCE),
-        }, timeout=10)
+    # -------------------------------
+    # Auth
+    # -------------------------------
+    def _auth_header(self):
+        token = self._get_token()
+        return {"Authorization": f"Bearer {token}"}
+
+    def _get_token(self):
+        # Se c'è un token “statico”, usalo
+        if self.static_token:
+            return self.static_token
+
+        # Se abbiamo token valido in cache, riutilizzalo
+        now = int(time.time())
+        if self._token and now < self._token_exp - 60:
+            return self._token
+
+        if not self.email or not self.password:
+            raise RuntimeError("CiaoBooking: credenziali non impostate e CIAOBOOKING_TOKEN assente.")
+
+        # Login
+        url = f"{self.base_url}/api/public/login"
+        files = {
+            "email": (None, self.email),
+            "password": (None, self.password),
+            "source": (None, self.source),
+        }
+        headers = {}
+        if self.locale:
+            headers["locale"] = self.locale
+
+        r = requests.post(url, files=files, headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json().get("data", {})
-        _token = data.get("token")
-        _token_exp = data.get("expiresAt", 0)
-        logging.info("CiaoBooking login OK; token valid until %s", _token_exp)
-        return True
-    except Exception as e:
-        logging.error("CiaoBooking login error: %s", e)
-        _token = None
-        _token_exp = 0
-        return False
+        token = data.get("token")
+        exp = data.get("expiresAt")
+        if not token:
+            raise RuntimeError("CiaoBooking: login OK ma token mancante.")
+        self._token = token
+        self._token_exp = int(exp) if exp else (int(time.time()) + 3600)
+        logging.info("CiaoBooking login OK; token valid until %s", self._token_exp)
+        return self._token
 
-def _auth_headers():
-    return {"Authorization": f"Bearer {_token}"} if _token else {}
-
-def normalize_phone(p: str) -> str:
-    return "".join(ch for ch in p if ch.isdigit())
-
-def find_client_by_phone(phone: str):
-    """Search client with GET /api/public/clients/paginated?search=..."""
-    if not _login():
-        return None
-    norm = normalize_phone(phone)
-    url = f"{BASE_URL}/api/public/clients/paginated"
-    try:
-        r = requests.get(url, params={"limit": "5", "page": "1", "search": norm},
-                         headers=_auth_headers(), timeout=10)
-        if r.status_code == 401:
-            # token expired → retry once
-            _login()
-            r = requests.get(url, params={"limit": "5", "page": "1", "search": norm},
-                             headers=_auth_headers(), timeout=10)
-        r.raise_for_status()
-        coll = r.json().get("data", {}).get("collection", [])
-        if coll:
-            return coll[0]
-        return None
-    except requests.HTTPError as he:
+    # -------------------------------
+    # Lookup cliente per telefono
+    # -------------------------------
+    def get_booking_context_by_phone(self, phone_number_normalized):
+        """
+        Ritorna:
+        {
+          "has_client": bool,
+          "client": {...} (se presente),
+        }
+        Usa /api/public/clients/paginated (POST) con campo 'search'.
+        """
         try:
+            url = f"{self.base_url}/api/public/clients/paginated"
+            payload = {
+                "limit": 5,
+                "page": 1,
+                "search": phone_number_normalized
+            }
+            headers = {
+                "Content-Type": "application/json",
+                **self._auth_header()
+            }
+            r = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
+            r.raise_for_status()
             js = r.json()
-            logging.info("CiaoBooking lookup skipped (status %s): %s", r.status_code, js)
-        except Exception:
-            logging.info("CiaoBooking lookup skipped (status %s)", r.status_code)
-        return None
-    except Exception as e:
-        logging.error("CiaoBooking error: %s", e)
-        return None
+            coll = (js.get("data") or {}).get("collection") or []
+            if not coll:
+                logging.info("CiaoBooking client NOT FOUND")
+                return {"has_client": False}
+            client = coll[0]
+            return {"has_client": True, "client": client}
+        except requests.HTTPError as e:
+            try:
+                js = e.response.json()
+                logging.error("CiaoBooking error: %s", json.dumps(js, ensure_ascii=False))
+            except Exception:
+                logging.error("CiaoBooking HTTP error: %s", e)
+            raise
+        except Exception as e:
+            logging.error("CiaoBooking generic error: %s", e)
+            raise
