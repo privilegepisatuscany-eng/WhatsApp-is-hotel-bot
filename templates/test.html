@@ -1,105 +1,77 @@
 <!doctype html>
 <html lang="it">
 <head>
-  <meta charset="utf-8" />
+  <meta charset="utf-8"/>
   <title>Test Bot</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#f7f7f8;color:#111}
-    .wrap{max-width:780px;margin:24px auto;padding:16px}
-    .row{display:flex;gap:8px;margin-bottom:8px}
-    input,button,textarea{font:inherit}
-    input,textarea{padding:10px;border:1px solid #ddd;border-radius:8px;flex:1;background:#fff}
-    button{padding:10px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
-    .chat{background:#fff;border:1px solid #eee;border-radius:12px; padding:10px 12px; height:420px; overflow:auto}
-    .msg{margin:8px 0;display:flex}
-    .me{justify-content:flex-end}
-    .me .bubble{background:#e8f0ff;color:#0a1b4d}
-    .bot .bubble{background:#f0f0f0}
-    .bubble{max-width:70%;padding:10px 12px;border-radius:12px}
-    .small{font-size:12px;color:#666;margin-top:2px}
+    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#f6f7f9; margin:0; padding:24px;}
+    .wrap{max-width:760px; margin:0 auto;}
+    .card{background:#fff; border-radius:12px; box-shadow:0 2px 10px rgba(0,0,0,.06); padding:16px;}
+    .row{display:flex; gap:8px; margin-bottom:8px;}
+    input,button{padding:10px 12px; border-radius:8px; border:1px solid #ddd; font-size:15px;}
+    button{background:#111827; color:white; border:none; cursor:pointer}
+    button:disabled{opacity:.6; cursor:not-allowed}
+    #chat{background:#0b0b0b; color:#e8e8e8; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; padding:12px; border-radius:8px; height:380px; overflow:auto; white-space:pre-wrap}
+    .sys{color:#9ca3af}
+    .me{color:#93c5fd}
+    .bot{color:#86efac}
+    .pill{display:inline-block; background:#111827; color:#fff; padding:6px 10px; border-radius:999px; font-size:12px; margin-right:6px}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h2>Tester Bot</h2>
+<div class="wrap">
+  <h2>Test WhatsApp Bot (no Twilio)</h2>
+  <div class="card">
     <div class="row">
-      <input id="phone" placeholder="Telefono (es: 3934...)" />
-      <button id="set">Usa numero</button>
-      <button id="reset">Reset conversazione</button>
+      <input id="phone" placeholder="Telefono (es. 393470416638)" style="flex:1"/>
+      <span class="pill">Ogni phone = conversazione separata</span>
     </div>
-    <div class="chat" id="chat"></div>
+    <div id="chat"></div>
     <div class="row">
-      <input id="msg" placeholder="Scrivi un messaggio..." />
+      <input id="msg" placeholder="Scrivi un messaggio..." style="flex:1"/>
       <button id="send">Invia</button>
     </div>
-    <div class="small">NB: questa pagina invia al backend su <code>/test_api</code> simulando Twilio.</div>
   </div>
+</div>
+<script>
+  const chat = document.getElementById('chat');
+  const phone = document.getElementById('phone');
+  const msg = document.getElementById('msg');
+  const btn = document.getElementById('send');
 
-  <script>
-    const chat = document.getElementById('chat');
-    const msg = document.getElementById('msg');
-    const phone = document.getElementById('phone');
-    let currentPhone = localStorage.getItem('tester_phone') || '';
+  function line(who, text){
+    const cls = who === 'me' ? 'me' : (who === 'bot' ? 'bot' : 'sys');
+    chat.innerHTML += `<div class="${cls}"><b>${who}:</b> ${text}</div>`;
+    chat.scrollTop = chat.scrollHeight;
+  }
 
-    function add(role, text){
-      const line = document.createElement('div');
-      line.className = 'msg ' + (role === 'me' ? 'me' : 'bot');
-      const b = document.createElement('div');
-      b.className = 'bubble';
-      b.textContent = text;
-      line.appendChild(b);
-      chat.appendChild(line);
-      chat.scrollTop = chat.scrollHeight;
-    }
+  btn.onclick = async () => {
+    const p = phone.value.trim();
+    const m = msg.value.trim();
+    if(!p || !m){ return; }
+    line('me', m);
+    btn.disabled = true;
+    try{
+      const res = await fetch('/test_api', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ phone: p, message: m })
+      });
+      const j = await res.json();
+      if(!j.ok){ line('sys', j.reply || 'Errore'); }
+      else{ line('bot', j.reply); }
+    }catch(err){ line('sys', 'Errore di rete'); }
+    btn.disabled = false;
+    msg.value = '';
+    msg.focus();
+  }
 
-    function loadHistory(){
-      const h = JSON.parse(localStorage.getItem('history_'+currentPhone) || '[]');
-      chat.innerHTML = '';
-      h.forEach(x => add(x.role,x.text));
-    }
-    function pushHistory(role, text){
-      const k = 'history_'+currentPhone;
-      const h = JSON.parse(localStorage.getItem(k) || '[]');
-      h.push({role,text});
-      localStorage.setItem(k, JSON.stringify(h));
-    }
+  msg.addEventListener('keydown', e => {
+    if(e.key === 'Enter'){ btn.click(); }
+  });
 
-    document.getElementById('set').onclick = ()=>{
-      if(!phone.value.trim()) return alert('Inserisci un numero');
-      currentPhone = phone.value.trim();
-      localStorage.setItem('tester_phone', currentPhone);
-      loadHistory();
-    };
-
-    document.getElementById('reset').onclick = ()=>{
-      if(!currentPhone) return alert('Imposta prima un numero');
-      localStorage.removeItem('history_'+currentPhone);
-      chat.innerHTML = '';
-      add('bot','✅ Conversazione resettata. Scrivi un messaggio.');
-    };
-
-    document.getElementById('send').onclick = async ()=>{
-      if(!currentPhone) return alert('Imposta prima un numero');
-      if(!msg.value.trim()) return;
-      const text = msg.value;
-      msg.value = '';
-      add('me', text);
-      pushHistory('me', text);
-
-      const fd = new FormData();
-      fd.append('Phone', currentPhone);
-      fd.append('Body', text);
-      const r = await fetch('/test_api', {method:'POST', body:fd});
-      const t = await r.text();
-      const m = t.match(/<Message>([\s\S]*?)<\/Message>/i);
-      const reply = m ? m[1] : '(nessuna risposta)';
-      add('bot', reply);
-      pushHistory('bot', reply);
-    };
-
-    // init
-    if(currentPhone){ phone.value = currentPhone; loadHistory(); }
-  </script>
+  line('sys', 'Conversazione pronta. Inserisci telefono e invia il primo messaggio.');
+</script>
 </body>
 </html>
