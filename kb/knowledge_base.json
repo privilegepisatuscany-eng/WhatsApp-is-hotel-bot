@@ -1,114 +1,43 @@
 {
-  "global_rules": {
-    "sensitive_keywords": [
-      "codice",
-      "pin",
-      "prenotazione",
-      "numero prenotazione",
-      "accesso",
-      "chiave",
-      "keybox",
-      "cassaforte",
-      "check-in con codice"
-    ],
-    "sensitive_response": "🔒 Per motivi di sicurezza, informazioni su codici o dettagli della prenotazione vengono fornite direttamente da Niccolò. Ti risponderà a breve."
-  },
   "structures": {
     "Relais dell’Ussero": {
-      "address": "Lungarno Sidney Sonnino 42, Pisa",
-      "checkin": "dalle 15:00 alle 04:00",
-      "checkout": "entro le 10:00",
-      "parking": "Parcheggio pubblico in Piazza Carrara a pochi metri. Tariffa ~1,50€/h.",
-      "notes": [
-        "Chiudere sempre le porte interne dell’ascensore: se restano aperte l’ascensore si blocca.",
-        "Self check-in con video istruzioni."
-      ],
+      "address": "Lungarno Sonnino 42, Pisa",
+      "parking": "Puoi parcheggiare al parcheggio pubblico di Piazza Carrara (1,50€/h), a pochi metri dal Relais.",
       "videos": {
-        "self_checkin": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share"
+        "checkin": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share"
       }
     },
     "Casa Monic": {
       "address": "Via San Martino 85, Pisa",
-      "checkin": "dalle 15:00 alle 04:00",
-      "checkout": "entro le 10:00 (rimuovere il codice dalla keybox)",
-      "parking": "Piazza Carrara o Piazza Santa Caterina (~400 m), 1,50€/h.",
-      "power": "Se salta la corrente: quadro in cucina (porta a sinistra entrando). Se non basta, quadro generale nel mobile delle cassette postali, accanto al portone verde. Alza la levetta del contatore 'COSCI LAURA'.",
+      "parking": "Parcheggi pubblici in Piazza Carrara o Piazza Santa Caterina, circa 400m dalla casa. 1,50€/h.",
+      "power_tips": "Per ripristinare la corrente: verifica il quadro in cucina (porta a sinistra all’ingresso). Se non torna, controlla il quadro generale accanto al portone verde, dentro le cassette della posta: cerca il contatore con scritto COSCI e solleva la leva.",
       "videos": {
-        "self_checkin": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
-        "power_restore": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share"
-      },
-      "host_contacts": {
-        "Monica": "+39 351 8143662",
-        "Niccolò": "+39 333 6011867"
+        "checkin": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
+        "power": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share"
       }
     },
     "Belle Vue": {
       "address": "Via del Borghetto 54, Pisa",
-      "checkin": "dalle 15:00 alle 04:00",
-      "checkout": "entro le 10:00",
-      "parking": "Sotto al palazzo in Via Antonio Rosmini o in Via Pasquale Galluppi. A pagamento 08:00–14:00, gratis dopo le 14:00. Garage custodito H24 in Via Piave (a pagamento).",
+      "parking": "Sotto al palazzo in via Antonio Rosmini o in via Pasquale Galluppi. A pagamento 08:00–14:00, poi gratis. Parcheggio custodito H24 in via Piave (a pagamento).",
       "videos": {
-        "self_checkin": "https://youtube.com/shorts/1iqknGhIFEc?feature=share"
+        "checkin": "https://youtube.com/shorts/1iqknGhIFEc?feature=share"
       }
     },
     "Villino di Monic": {
-      "address": "Via Vincenzo Gioberti (ang. Via del Bastione), Pisa",
-      "checkin": "dalle 15:00 alle 04:00",
-      "checkout": "entro le 10:00",
-      "parking": "Di fronte alla casa in Via Vincenzo Gioberti (strisce blu, lato destro). Alternativa in Via del Bastione. A pagamento 08:00–14:00, gratis dopo.",
-      "videos": {},
-      "power": "Non presente in KB: per guasti o corrente scrivi a Niccolò."
+      "address": "Via Delle Belle Torri 50, Pisa",
+      "parking": "Posteggio auto privato incluso.",
+      "videos": {}
     },
     "Casa di Gina": {
       "address": "Via Giuseppe Montanelli 33, Pisa",
-      "checkin": "dalle 15:00 alle 04:00",
-      "checkout": "entro le 10:00",
       "parking": "Via Crispi, Piazza Aurelio Saffi o Lungarno Sidney Sonnino (1,50€/h).",
       "videos": {
-        "self_checkin": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share"
+        "checkin": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share"
       }
     }
   },
-  "transfer_policy": {
-    "public_taxi_number": "+39 050 541600",
-    "ncc": {
-      "aeroporto<->città": 50,
-      "città<->città": 40,
-      "notes": [
-        "All'arrivo in aeroporto l'autista attende con cartello nome.",
-        "Pagamento contanti o carta.",
-        "Per prenotare servono: orario, luogo di partenza, destinazione, numero persone. Se da/verso aeroporto puoi indicare numero volo."
-      ]
-    }
-  },
-  "hospitality": {
-    "wifi": "Troverai nome rete e password in camera/appartamento (sotto cartello free Wi‑Fi o vicino al modem).",
-    "heating": "Riscaldamento centralizzato: si accende automaticamente a orari stabiliti (appartamenti).",
-    "cleaning": "Pulizia extra su richiesta; include cambio biancheria. Costo allineato a quanto pagato su Booking.",
-    "breakfast": "Relais: mar-dom 07:00–12:00 al Caffè dell’Ussero (piano terra); lun 07:00–12:00 Pasticceria Macchi. Ticket in camera.",
-    "thanks_checkout": "Grazie per il soggiorno! Se ti va, lascia una recensione su Booking: ci aiuta molto."
-  },
-  "emergency": {
-    "numbers": {
-      "Vigili del Fuoco": "115",
-      "Ambulanza": "118",
-      "Polizia": "113"
-    },
-    "hosts": {
-      "Monica": "+39 351 8143662",
-      "Niccolò": "+39 333 6011867"
-    }
-  }
-}
-{
-  "videos": {
-    "Relais dell’Ussero": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share",
-    "Casa Monic": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
-    "Belle Vue": "https://youtube.com/shorts/1iqknGhIFEc?feature=share",
-    "Casa di Gina": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share",
-    "Casa Monic (ripristino corrente)": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share"
-  },
-  "emergenze": {
-    "casa_monic_corrente": "Per il ripristino della corrente a Casa Monic: apri la porta in cucina e verifica il quadro elettrico. Se non basta, controlla il quadro generale accanto al portone verde (armadio cassette della posta) e riporta su la leva del contatore con la scritta COSCI."
+  "transfer_rules": {
+    "airport_city": 50,
+    "city_city": 40
   }
 }
