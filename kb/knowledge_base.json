@@ -100,3 +100,15 @@
     }
   }
 }
+{
+  "videos": {
+    "Relais dell’Ussero": "https://youtube.com/shorts/XnBcl2T-ewM?feature=share",
+    "Casa Monic": "https://youtube.com/shorts/YHX-7uT3itQ?feature=share",
+    "Belle Vue": "https://youtube.com/shorts/1iqknGhIFEc?feature=share",
+    "Casa di Gina": "https://youtube.com/shorts/Wi-mevoKB3w?feature=share",
+    "Casa Monic (ripristino corrente)": "https://youtube.com/shorts/UIozKt4ZrCk?feature=share"
+  },
+  "emergenze": {
+    "casa_monic_corrente": "Per il ripristino della corrente a Casa Monic: apri la porta in cucina e verifica il quadro elettrico. Se non basta, controlla il quadro generale accanto al portone verde (armadio cassette della posta) e riporta su la leva del contatore con la scritta COSCI."
+  }
+}
