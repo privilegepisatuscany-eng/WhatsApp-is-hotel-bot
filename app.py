@@ -5,6 +5,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 from ciao_booking_client import CiaoBookingClient
 from utils import normalize_sender, clamp_history
