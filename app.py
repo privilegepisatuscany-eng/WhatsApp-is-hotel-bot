@@ -1,273 +1,188 @@
-import os
-import json
-import logging
-from flask import Flask, request, render_template, jsonify
+import os, json, time, logging
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, Response
 from twilio.twiml.messaging_response import MessagingResponse
+import requests
 
-from state import MemoryStore
-from nlp import detect_intent, normalize_sender, fmt_euro
-from ciao_booking_client import (
-    cb_login,
-    find_client_by_phone,
-    find_reservation_by_ref,
-)
-# Carica KB
-with open(os.path.join("kb", "knowledge_base.json"), "r", encoding="utf-8") as f:
+# === Logging robusto (accetta "debug", "info", ecc.) ===
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in {"CRITICAL","ERROR","WARNING","INFO","DEBUG"}:
+    LOG_LEVEL = "INFO"
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+
+# === OpenAI ===
+import openai
+openai.api_key = os.environ.get("OPENAI_API_KEY")
+
+# === CiaoBooking client (inline leggero) ===
+CIAOBOOKING_BASE = os.environ.get("CIAOBOOKING_BASE", "https://api.ciaobooking.com")
+CIAOBOOKING_EMAIL = os.environ.get("CIAOBOOKING_EMAIL", "")
+CIAOBOOKING_PASSWORD = os.environ.get("CIAOBOOKING_PASSWORD", "")
+CIAOBOOKING_LOCALE = os.environ.get("CIAOBOOKING_LOCALE", "it")
+
+_session_cache = {
+    # sender: {"ctx": {...}, "exp": epoch}
+}
+
+def _cb_login():
+    url = f"{CIAOBOOKING_BASE}/api/public/login"
+    files = {
+        "email": (None, CIAOBOOKING_EMAIL),
+        "password": (None, CIAOBOOKING_PASSWORD),
+        "source": (None, "bot"),
+    }
+    r = requests.post(url, files=files, timeout=7)
+    r.raise_for_status()
+    data = r.json()["data"]
+    token = data["token"]
+    exp = data["expiresAt"]
+    logging.info("CiaoBooking login OK; token valid until %s", exp)
+    return token
+
+def _cb_headers(token):
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+def cb_find_client_by_phone(token, phone_normalized):
+    # GET /api/public/clients/paginated?search=... (NB: GET!)
+    params = {
+        "limit": "5",
+        "page": "1",
+        "search": phone_normalized,
+        "order": "asc",
+        "sortBy[]": "name",
+    }
+    url = f"{CIAOBOOKING_BASE}/api/public/clients/paginated"
+    r = requests.get(url, headers=_cb_headers(token), params=params, timeout=7)
+    if r.status_code >= 400:
+        logging.error("CiaoBooking error: %s", r.text)
+        r.raise_for_status()
+    data = r.json().get("data", {}).get("collection", [])
+    if not data:
+        logging.info("CiaoBooking: client non trovato (%s)", phone_normalized)
+        return None
+    return data[0]
+
+def cb_get_reservation_by_id(token, res_id):
+    url = f"{CIAOBOOKING_BASE}/api/public/reservations/{res_id}"
+    r = requests.get(url, headers=_cb_headers(token), timeout=7)
+    if r.status_code == 404:
+        logging.error("CiaoBooking reservation error: %s", r.text)
+        return None
+    r.raise_for_status()
+    return r.json().get("data")
+
+def normalize_sender(v):
+    # es. "whatsapp:+39347...." -> "39347..."
+    v = v or ""
+    v = v.replace("whatsapp:", "")
+    v = v.replace("+", "")
+    return v.strip()
+
+# === KB in JSON (caricata una volta) ===
+with open("knowledge_base.json", "r", encoding="utf-8") as f:
     KB = json.load(f)
 
-# Logging robusto: accetta "debug"/"INFO"/etc.
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-if LOG_LEVEL not in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
-    LOG_LEVEL = "INFO"
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+# Mappa rapida video (per prompt e risposte)
+VIDEOS = KB.get("videos", {})
 
 app = Flask(__name__)
-state = MemoryStore()
 
-# --- Helper risposta WhatsApp/Test ---
-def twiml(text):
+def _load_or_make_context(sender, incoming_text):
+    now = int(time.time())
+    entry = _session_cache.get(sender)
+
+    # scadenza cache 2h
+    if entry and entry.get("exp", 0) > now:
+        return entry["ctx"]
+
+    ctx = {
+        "sender": sender,
+        "has_booking": False,
+        "booking": None,    # raw from API if available
+        "property": None,   # es. "Casa Monic", "Belle Vue", ...
+        "docs_sent": None,  # se riusciamo a dedurre in futuro
+    }
+
+    # Primo messaggio: prova lookup
+    try:
+        token = _cb_login()
+        # 1) client via telefono
+        cli = cb_find_client_by_phone(token, sender)
+        if cli:
+            ctx["has_booking"] = True
+            # qui potresti anche cercare le reservation del client se serve:
+            # (l'API "reservations" non espone direttamente "search by client" nella spec qui,
+            # quindi teniamo minimal e lasciamo all'utente fornirci un eventuale id)
+        else:
+            # 2) se il messaggio contiene un possibile reservation id, prova
+            # estrai numeri lunghi:
+            import re
+            m = re.search(r"\b(\d{7,})\b", incoming_text)
+            if m:
+                res_id = m.group(1)
+                res = cb_get_reservation_by_id(token, res_id)
+                if res:
+                    ctx["has_booking"] = True
+                    ctx["booking"] = res
+                    # prova dedurre property name se presente
+                    prop = res.get("property", {}).get("name") or None
+                    ctx["property"] = prop
+    except requests.HTTPError as e:
+        logging.error("Errore lookup CiaoBooking: %s", e)
+    except Exception as e:
+        logging.error("Errore generico lookup CiaoBooking: %s", e)
+
+    _session_cache[sender] = {"ctx": ctx, "exp": now + 7200}
+    return ctx
+
+def build_system_prompt(ctx):
+    """
+    Prompt minimale: niente flussi rigidi, l'LLM usa KB + eventuale contesto prenotazione.
+    """
+    kb_compact = {
+        "addresses": KB.get("addresses", {}),
+        "parking": KB.get("parking", {}),
+        "transfer": KB.get("transfer", {}),
+        "emergency": KB.get("emergency", {}),
+        "rules": KB.get("rules", {}),
+        "videos": KB.get("videos", {}),
+        "checkin": KB.get("checkin", {}),
+        "breakfast": KB.get("breakfast", {}),
+        "wifi_hint": KB.get("wifi_hint", ""),
+    }
+
+    sys = (
+        "Sei un assistente per una struttura ricettiva a Pisa. "
+        "Rispondi in italiano, con tono cordiale e conciso. "
+        "Usa esclusivamente le informazioni nella KB fornita e nel contesto prenotazione.\n\n"
+        f"CONTESTO_PRENOTAZIONE: {json.dumps(ctx, ensure_ascii=False)}\n\n"
+        f"KNOWLEDGE_BASE: {json.dumps(kb_compact, ensure_ascii=False)}\n\n"
+        "Linee guida:\n"
+        "- Non elencare info non richieste.\n"
+        "- Se l'utente chiede orari o accesso, usa i dati della KB e includi il link al video se esiste per la struttura.\n"
+        "- Transfer: tariffe KB (Aeroporto↔Città 50€, Città↔Città 40€); se utente fornisce già partenza/destinazione/orario/persone, non richiedere di nuovo. Poi chiedi solo conferma finale.\n"
+        "- Parcheggio: se non è chiara la struttura, chiedi solo quella informazione e poi rispondi con il parcheggio specifico.\n"
+        "- Corrente: se l'utente chiede ripristino a Casa Monic, fornisci anche il link al video se presente.\n"
+        "- Evita di resettare la conversazione; non ripartire con domande generiche se hai già i dati.\n"
+    )
+    return sys
+
+def call_llm(system_prompt, user_text):
+    resp = openai.ChatCompletion.create(
+        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text}
+        ],
+    )
+    return resp["choices"][0]["message"]["content"].strip()
+
+def reply_text(text):
+    # usato sia per Twilio (TwiML) che per test web
     tw = MessagingResponse()
     tw.message(text)
     return str(tw)
-
-def answer_text(text):
-    # per /test_api (ritorna semplice stringa)
-    return text
-
-# --- Intent Handlers ---
-
-def handle_greeting(ctx, kb):
-    """
-    Primo messaggio: se non abbiamo ancora il contesto CiaoBooking per il caller,
-    proviamo lookup automatico (in base al numero) UNA sola volta.
-    Poi chiediamo subito lo scopo (Taxi/Transfer, Parcheggio, Video/Accesso),
-    e SE non troviamo il cliente chiediamo nome o ref se serve.
-    """
-    greeting = "Ciao! Come posso aiutarti oggi?"
-    # Lookup automatico una volta per sessione
-    if not ctx.get("cb_checked"):
-        ctx["cb_checked"] = True
-        token = cb_login()
-        if token:
-            client = find_client_by_phone(ctx["phone"], token)
-            if client:
-                ctx["client"] = client
-                ctx["client_known"] = True
-                logging.info("CiaoBooking: client trovato")
-            else:
-                ctx["client_known"] = False
-                logging.info("CiaoBooking: client non trovato (%s)", ctx["phone"])
-        else:
-            logging.warning("CiaoBooking login fallito; procedo senza contesto")
-    # Prompt breve, niente reset conversazione
-    follow = "Posso aiutarti con *Taxi/Transfer*, *Parcheggio* o *Video/Accesso*."
-    # Se non riconosciuto il cliente, **non** chiediamo più numeri di telefono,
-    # ma se l’utente scrive esplicitamente “ho prenotazione” poi raccoglieremo ref nell’intent.
-    return f"{greeting}\n{follow}"
-
-def handle_transfer(ctx, kb, msg):
-    """
-    Flusso transfer: 2 regole semplici
-    - Se il testo indica aeroporto ↔ città, tariffa 50€.
-    - Altrimenti 40€.
-    Raccogliamo: persone, orario, partenza/destinazione (solo quelli mancanti).
-    Poi **chiediamo conferma tariffa** e chiudiamo.
-    """
-    form = ctx.setdefault("transfer_form", {"people": None, "time": None, "from": None, "to": None})
-    lower = msg.lower()
-
-    # Pre‑estrazione semplice
-    import re
-    if form["people"] is None:
-        m = re.search(r"\b(\d+)\s*(persone|ospiti|pax)?\b", lower)
-        if m:
-            form["people"] = int(m.group(1))
-    if form["time"] is None:
-        m = re.search(r"\b(\d{1,2}[:\.]\d{2})\b", lower)
-        if m:
-            form["time"] = m.group(1).replace(".", ":")
-
-    # Partenza/destinazione
-    if form["from"] is None:
-        if "aeroporto" in lower:
-            form["from"] = "Aeroporto"
-        elif "stazione" in lower:
-            form["from"] = "Stazione"
-    if form["to"] is None:
-        # nomi strutture note
-        for name in kb["structures"].keys():
-            if name.lower() in lower:
-                form["to"] = name
-                break
-
-    # Se l’utente ha scritto esplicitamente “dall’aeroporto a X”
-    if "dall'aeroporto" in lower or "dall aeroporto" in lower:
-        form["from"] = "Aeroporto"
-    if "allo" in lower or "a " in lower:
-        # già coperto sopra dal match struttura, lasciamo così per semplicità
-        pass
-
-    # Chiedi solo i campi mancanti, con ordine smart
-    if form["people"] is None:
-        return "Quante persone siete per il transfer?"
-    if form["time"] is None:
-        return "A che ora desideri la partenza?"
-    if form["from"] is None:
-        return "Da dove partite? (Aeroporto/Stazione/Altro)"
-    if form["to"] is None:
-        return "Qual è la destinazione? (puoi indicare la struttura)"
-
-    # Tutti i dati: calcolo tariffa
-    def is_airport_leg(a, b):
-        a = (a or "").lower()
-        b = (b or "").lower()
-        return "aeroporto" in a or "aeroporto" in b
-
-    price = 50 if is_airport_leg(form["from"], form["to"]) else 40
-    ctx["transfer_price"] = price
-
-    summary = (
-        "Perfetto, ho raccolto questi dati:\n"
-        f"• Persone: {form['people']}\n"
-        f"• Orario: {form['time']}\n"
-        f"• Partenza: {form['from']}\n"
-        f"• Destinazione: {form['to']}\n\n"
-        f"Tariffa: {fmt_euro(price)}.\n"
-        "Confermi che la tariffa ti sta bene? (sì/no)"
-    )
-    ctx["pending"] = "transfer_confirm"
-    return summary
-
-def handle_transfer_confirm(ctx, msg):
-    if msg.strip().lower() in ("si", "sì", "ok", "va bene", "confermo"):
-        ctx.pop("pending", None)
-        return "👍 Perfetto, ho memorizzato la conferma. Niccolò ti contatterà a breve per i dettagli finali."
-    elif msg.strip().lower() in ("no", "non va bene"):
-        ctx.pop("pending", None)
-        return "Ok, allora non procedo. Se vuoi modificare orario o tratta, dimmelo pure."
-    else:
-        return "Per favore rispondi *sì* o *no* alla conferma della tariffa."
-
-def handle_parking(ctx, kb, msg):
-    """
-    Parcheggio: chiedi la struttura se non nota; poi rispondi solo con quelle info.
-    """
-    structure = ctx.get("structure")
-    if not structure:
-        # Prova estrazione rapida dal messaggio
-        for name in kb["structures"].keys():
-            if name.lower() in msg.lower():
-                structure = name
-                ctx["structure"] = name
-                break
-    if not structure:
-        # chiedi
-        names = ", ".join(kb["structures"].keys())
-        return f"Per il parcheggio, in quale struttura ti trovi? ({names})"
-
-    info = kb["structures"].get(structure, {})
-    parking = info.get("parking")
-    if not parking:
-        return "Per questa struttura non ho dettagli di parcheggio aggiornati. Ti farò contattare da Niccolò."
-    return parking
-
-def handle_videos(ctx, kb, msg):
-    """
-    Mostra solo i video pertinenti alla struttura richiesta (o chiedi la struttura).
-    Include video check-in e video ripristino corrente se presenti.
-    """
-    structure = ctx.get("structure")
-    for name in kb["structures"].keys():
-        if name.lower() in msg.lower():
-            structure = name
-            ctx["structure"] = name
-            break
-
-    if not structure:
-        names = ", ".join(kb["structures"].keys())
-        return f"Per i video, dimmi la struttura: ({names})"
-
-    s = kb["structures"].get(structure, {})
-    vids = s.get("videos", {})
-    chunks = []
-    if vids.get("checkin"):
-        chunks.append(f"🎥 Video check‑in: {vids['checkin']}")
-    if vids.get("power"):
-        chunks.append(f"🔌 Ripristino corrente: {vids['power']}")
-    if not chunks:
-        return "Per questa struttura non ho video associati al momento."
-    return "\n".join(chunks)
-
-def handle_power(ctx, kb, msg):
-    """
-    Se chiede corrente, prova a legare alla struttura.
-    Se è Casa Monic, inserisci anche il video.
-    """
-    structure = ctx.get("structure")
-    for name in kb["structures"].keys():
-        if name.lower() in msg.lower():
-            structure = name
-            ctx["structure"] = name
-            break
-
-    if not structure:
-        names = ", ".join(kb["structures"].keys())
-        return f"Per aiutarti sul ripristino corrente, dimmi la struttura: ({names})"
-
-    s = kb["structures"].get(structure, {})
-    tips = s.get("power_tips")
-    video = s.get("videos", {}).get("power")
-    if tips and video:
-        return f"{tips}\n\n🎥 Video: {video}"
-    if tips:
-        return tips
-    return "Per questa struttura non ho istruzioni sul ripristino corrente. Ti faccio contattare da Niccolò."
-
-# --- Router principale ---
-def route_message(ctx, kb, msg):
-    # Pending step? (es. conferma transfer)
-    if ctx.get("pending") == "transfer_confirm":
-        return handle_transfer_confirm(ctx, msg)
-
-    intent = detect_intent(msg)
-
-    if intent == "transfer":
-        ctx["last_intent"] = "transfer"
-        return handle_transfer(ctx, kb, msg)
-
-    if intent == "parking":
-        ctx["last_intent"] = "parking"
-        return handle_parking(ctx, kb, msg)
-
-    if intent == "video":
-        ctx["last_intent"] = "video"
-        return handle_videos(ctx, kb, msg)
-
-    if intent == "power":
-        ctx["last_intent"] = "power"
-        return handle_power(ctx, kb, msg)
-
-    # Se riconosce un numero prenotazione, prova lookup (non obbligatorio per transfer/taxi)
-    import re
-    m = re.search(r"\b(\d{6,})\b", msg)
-    if m:
-        token = cb_login()
-        if token:
-            res = find_reservation_by_ref(m.group(1), token)
-            if res:
-                ctx["reservation_ref"] = m.group(1)
-                # Se la prenotazione ha unit/property note, puoi salvarle in ctx["structure"] se mappabili
-                return "Ok, ho collegato la tua prenotazione. Come posso aiutarti? *Taxi/Transfer*, *Parcheggio* o *Video/Accesso*."
-        # se non trovata, non bloccare: si continua normalmente
-
-    # fallback: greeting
-    return handle_greeting(ctx, kb)
-
-# --- Flask routes ---
 
 @app.route("/", methods=["GET"])
 def root():
@@ -280,41 +195,108 @@ def webhook():
     sender = normalize_sender(sender_raw)
     logging.debug("Inbound da %s: %s", sender, body)
 
-    # stato conversazione
-    ctx = state.get(sender)
-    if not ctx:
-        ctx = {"phone": sender.replace("whatsapp:", "").replace("+", "").strip()}
-        state.set(sender, ctx)
+    ctx = _load_or_make_context(sender, body)
+    system_prompt = build_system_prompt(ctx)
+    answer = call_llm(system_prompt, body)
 
-    reply = route_message(ctx, KB, body)
+    return Response(reply_text(answer), mimetype="application/xml")
 
-    # Se la richiesta arriva da Twilio, rispondiamo con TwiML
-    if "whatsapp:" in sender_raw or request.form.get("MessageSid"):
-        return twiml(reply)
-    # Per sicurezza (non dovrebbe capitare)
-    return reply
+# ========== Pagina di test ==========
+TEST_HTML = """
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Bot Test</title>
+<style>
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin:0; background:#f6f7f9; }
+.container { max-width: 900px; margin: 0 auto; padding: 24px; }
+.card { background:#fff; border-radius:16px; box-shadow:0 2px 12px rgba(0,0,0,.06); padding:20px; }
+h1 { margin:0 0 8px; font-size:20px; }
+small{ color:#666; }
+.row { display:flex; gap:10px; margin: 12px 0; }
+input, textarea, button {
+  font-size:16px; padding:10px 12px; border:1px solid #e3e5ea; border-radius:10px;
+}
+input[type=text]{ flex:1; }
+textarea{ width:100%; height:74px; resize:vertical; }
+button { background:#111827; color:#fff; border:none; cursor:pointer; border-radius:10px; }
+button:disabled{ opacity:.5; }
+.chat { background:#fafafa; border:1px solid #eee; border-radius:14px; padding:14px; height:360px; overflow:auto; }
+.msg { margin:8px 0; }
+.me { text-align:right; }
+.me .bubble { display:inline-block; background:#0ea5e9; color:#fff; padding:8px 12px; border-radius:12px 12px 0 12px; }
+.bot .bubble { display:inline-block; background:#e5e7eb; color:#111; padding:8px 12px; border-radius:12px 12px 12px 0; }
+.sys { text-align:center; color:#666; font-size:12px; }
+footer { color:#777; margin-top:12px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <h1>Test WhatsApp Bot (Render)</h1>
+    <small>Simula messaggi verso <code>/webhook</code> senza Twilio.</small>
+    <div class="row">
+      <input id="phone" type="text" placeholder="Telefono (es. 39347...)" />
+      <button id="start">Avvia</button>
+    </div>
+    <div class="chat" id="chat"></div>
+    <div class="row">
+      <textarea id="msg" placeholder="Scrivi un messaggio..."></textarea>
+      <button id="send">Invia</button>
+    </div>
+    <footer>La cronologia resta in pagina finché non ricarichi.</footer>
+  </div>
+</div>
+<script>
+const chat = document.getElementById('chat');
+const phoneInput = document.getElementById('phone');
+const startBtn = document.getElementById('start');
+const sendBtn = document.getElementById('send');
+const msgInput = document.getElementById('msg');
 
-# --- Test UI ---
+function addMsg(who, text){
+  const d = document.createElement('div');
+  d.className = 'msg ' + who;
+  if(who==='sys'){ d.innerHTML = '<div class="sys">'+text+'</div>'; chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return; }
+  const b = document.createElement('span');
+  b.className = 'bubble';
+  b.textContent = text;
+  d.appendChild(b);
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+startBtn.onclick = () => {
+  if(!phoneInput.value.trim()){ alert('Inserisci un telefono'); return; }
+  addMsg('sys','Conversazione pronta. Inserisci messaggi sotto.');
+};
+
+sendBtn.onclick = async () => {
+  const phone = phoneInput.value.trim();
+  const text = msgInput.value.trim();
+  if(!phone || !text) return;
+  addMsg('me', text);
+  msgInput.value = '';
+  const fd = new FormData();
+  fd.append("From", "whatsapp:+" + phone);
+  fd.append("Body", text);
+  const r = await fetch('/webhook', { method: 'POST', body: fd });
+  const xml = await r.text();
+  // Estrai testo dalla TwiML <Message>
+  const m = xml.match(/<Message>([\\s\\S]*?)<\\/Message>/);
+  const reply = m ? m[1] : '(nessuna risposta)';
+  addMsg('bot', reply);
+};
+</script>
+</body>
+</html>
+"""
+
 @app.route("/test", methods=["GET"])
 def test_page():
-    return render_template("test.html")
-
-@app.route("/test_api", methods=["POST"])
-def test_api():
-    data = request.get_json(force=True, silent=True) or {}
-    phone = (data.get("phone") or "").strip()
-    message = (data.get("message") or "").strip()
-    if not phone or not message:
-        return jsonify({"ok": False, "reply": "Telefono e messaggio sono obbligatori"}), 400
-
-    sender = phone
-    ctx = state.get(sender)
-    if not ctx:
-        ctx = {"phone": phone}
-        state.set(sender, ctx)
-
-    reply = route_message(ctx, KB, message)
-    return jsonify({"ok": True, "reply": reply})
+    return Response(TEST_HTML, mimetype="text/html")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
