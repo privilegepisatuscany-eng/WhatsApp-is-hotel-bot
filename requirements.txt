@@ -1,4 +1,5 @@
-Flask==3.0.3
+flask==3.0.3
 gunicorn==22.0.0
+twilio==9.3.1
+openai==1.40.2
 requests==2.32.3
-python-dotenv==1.0.1
