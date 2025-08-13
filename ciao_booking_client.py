@@ -122,50 +122,57 @@ class CiaoBookingClient:
         data = self._get("/api/public/reservations", params=params)
         return data.get("data", data)
 
-    def find_recent_reservation_for_client(
-        self,
-        client_id: int,
-        days_back: int = 30,
-        days_forward: int = 30,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Cerca una reservation CONFIRMED per client_id in una finestra temporale,
-        con priorità: in-corso/oggi > future più vicine > passate recenti.
-        """
-        today = date.today()
-        frm = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        to  = (today + timedelta(days=days_forward)).strftime("%Y-%m-%d")
+def find_recent_reservation_for_client(
+    self,
+    client_id: int,
+    days_back: int = 365,
+    days_forward: int = 365,
+) -> Optional[Dict[str, Any]]:
+    """
+    Cerca una reservation per client_id in una finestra ampia.
+    Ordina per rilevanza: in corso, future, passate, priorità status, distanza.
+    """
+    from datetime import date, timedelta
 
-        raw = self.list_reservations(from_date=frm, to_date=to, status="confirmed", limit=200, offset=0)
-        coll = (raw.get("collection") if isinstance(raw, dict) else None) or []
+    today = date.today()
+    frm = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    to  = (today + timedelta(days=days_forward)).strftime("%Y-%m-%d")
 
-        candidates = []
-        for r in coll:
-            cid = r.get("client_id") or (r.get("client") or {}).get("id")
-            if cid == client_id:
-                candidates.append(r)
+    raw = self.list_reservations(from_date=frm, to_date=to, status=None, limit=200, offset=0)
+    coll = (raw.get("collection") if isinstance(raw, dict) else None) or []
 
-        if not candidates:
-            return None
+    candidates = []
+    for r in coll:
+        cid = r.get("client_id") or (r.get("client") or {}).get("id")
+        if cid == client_id:
+            candidates.append(r)
 
-        def k(res):
-            s = res.get("start_date")
-            e = res.get("end_date")
-            try:
-                ds = date.fromisoformat(s) if s else date.min
-                de = date.fromisoformat(e) if e else date.max
-            except Exception:
-                ds, de = date.min, date.max
-            if ds <= today < de or ds == today:
-                rank = 0
-            elif ds > today:
-                rank = 1
-            else:
-                rank = 2
-            return (rank, abs((ds - today).days))
+    if not candidates:
+        return None
 
-        candidates.sort(key=k)
-        return candidates[0]
+    status_rank = {"CONFIRMED": 0, "PENDING": 1}
+    def rank(res):
+        try:
+            ds = date.fromisoformat(res.get("start_date", "")[:10])
+            de = date.fromisoformat(res.get("end_date", "")[:10])
+        except Exception:
+            ds, de = date.min, date.max
+
+        if ds <= today <= de:
+            pos = 0
+        elif ds > today:
+            pos = 1
+        else:
+            pos = 2
+
+        st_norm = (res.get("status") or "").upper()
+        s_rank = status_rank.get(st_norm, 9)
+        dist = abs((ds - today).days)
+
+        return (pos, s_rank, dist)
+
+    candidates.sort(key=rank)
+    return candidates[0]
 
     # ---------- High level ----------
     def get_booking_context(
