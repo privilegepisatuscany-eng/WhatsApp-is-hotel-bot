@@ -498,38 +498,37 @@ async function send(){
 def test_page():
     return Response(TEST_HTML, mimetype="text/html")
 
-@app.route("/test_api", methods=["POST"])
+# --- TEST API: invio messaggi senza Twilio ---
+@app.post("/test_api")
 def test_api():
+    # accetta JSON o form
+    payload = request.get_json(silent=True) or {}
+    phone = (payload.get("phone") or request.form.get("phone") or "").strip()
+    text  = (
+        payload.get("message")
+        or payload.get("body")
+        or request.form.get("message")
+        or request.form.get("body")
+        or ""
+    ).strip()
+
+    if not phone or not text:
+        logging.error(
+            "Bad /test_api payload. CT=%s, json=%s, form=%s",
+            request.headers.get("Content-Type"),
+            payload,
+            dict(request.form)
+        )
+        return jsonify({"ok": False, "error": "missing phone or message"}), 400
+
+    # usa la stessa logica del webhook
     try:
-        payload = request.get_json(silent=True) or {}
-        phone = (payload.get("phone") or "").replace("+", "").strip()
-        body = (payload.get("body") or "").strip()
-
-        if not body:
-            return jsonify({"error": "missing body"}), 400
-
-        # NB: se manca il phone, NON 400. Simuliamo un mittente "anonimo"
-        if not phone:
-            phone = "0000000000"
-
-        # Lookup CiaoBooking (best-effort)
-        booking_ctx = {}
-        try:
-            # se il messaggio contiene un ID numerico a 10+ cifre, trattalo come reservation_id
-            reservation_id = None
-            tokens = [t for t in body.split() if t.isdigit()]
-            if tokens:
-                # prendi quello più lungo
-                reservation_id = max(tokens, key=len)
-            booking_ctx = CB.get_booking_context(phone=phone, reservation_id=reservation_id)
-        except Exception as e:
-            logger.error("Errore lookup CiaoBooking (test): %s", e)
-
-        reply = generate_bot_reply(sender=phone, body=body, booking_ctx=booking_ctx)
-        return jsonify({"reply": reply})
+        reply_text = handle_incoming_message(phone, text)  # <-- funzione che usi nel webhook
     except Exception as e:
-        logger.exception("Errore /test_api")
-        return jsonify({"error": str(e)}), 500
+        logging.exception("Errore handle_incoming_message: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "reply": reply_text}), 200
 
 # === Healthcheck e root ===
 @app.route("/", methods=["GET"])
