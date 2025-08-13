@@ -28,7 +28,6 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # === Utils ===
 def normalize_sender(s: str) -> str:
-    # Twilio WhatsApp => "whatsapp:+39347..."
     s = s or ""
     s = s.replace("whatsapp:", "").replace("+", "").strip()
     return re.sub(r"\D", "", s)
@@ -75,7 +74,8 @@ CB = CiaoBookingClient(
 # session_store[phone] = {
 #   "history": [...],
 #   "booking_ctx": {...},
-#   "last_property": "casa di gina",
+#   "last_intent": "video"|"parking"|"transfer"|None,
+#   "awaiting_property_for": "video"|"parking"|None,
 #   "created_at": ISO
 # }
 session_store: Dict[str, Dict[str, Any]] = {}
@@ -106,12 +106,6 @@ def _parse_ymd(d: Optional[str]) -> Optional[date]:
 
 # === Politiche video/accesso ===
 def should_offer_checkin_assets_auto(booking_ctx: Dict[str, Any]) -> bool:
-    """
-    AUTO: mostrare link SOLO se:
-    - reservation.status = CONFIRMED
-    - is_checkin_completed in {COMPLETED, VERIFIED}
-    - oggi è giorno di arrivo o soggiorno in corso
-    """
     res = (booking_ctx or {}).get("reservation") or {}
     if not res:
         return False
@@ -132,19 +126,15 @@ def should_offer_checkin_assets_auto(booking_ctx: Dict[str, Any]) -> bool:
     return False
 
 def explicit_access_request_blocked(booking_ctx: Dict[str, Any]) -> bool:
-    """
-    SU RICHIESTA ESPLICITA: blocchiamo link SOLO se abbiamo una reservation
-    e il check-in risulta TO_DO.
-    """
     res = (booking_ctx or {}).get("reservation") or {}
     if not res:
-        return False  # senza reservation non blocchiamo: rispondiamo da KB
+        return False
     chk = (res.get("is_checkin_completed") or "").upper()
     return chk in ("TO_DO", "0", "")
 
 # === Property helpers ===
 ALIASES = {
-    "casa monic": ["casa monic", "monic", "casa di monic", "villino di monic"],
+    "casa monic": ["casa monic", "monic", "casa di monic"],
     "relais dell’ussero": ["relais", "ussero", "relais dell'ussero", "relais dell’ussero"],
     "belle vue": ["belle vue", "bellevue"],
     "casa di gina": ["casa di gina", "gina"],
@@ -159,26 +149,26 @@ def extract_property_from_text(text: str) -> Optional[str]:
         for a in arr:
             if a in t:
                 return canonical
-    # fallback: match diretto su chiavi KB
     for k in KB.get("videos", {}):
         if k in t:
             return k
     return None
 
 def property_name_from_ctx(booking_ctx: Dict[str, Any]) -> Optional[str]:
-    res = (booking_ctx or {}).get("reservation") or {}
-    prop = (res.get("property") or {}).get("name") or res.get("property_name")
+    res = (booking_ctx or {}).get("reservation") | {}
+    if isinstance(res, dict):
+        prop = (res.get("property") or {}).get("name") or res.get("property_name")
+    else:
+        prop = None
     return prop.strip() if prop else None
 
 def kb_video_for_property(name: str) -> Optional[str]:
     key = normalize_property_key(name)
-    videos = KB.get("videos", {})
-    return videos.get(key) or None
+    return KB.get("videos", {}).get(key)
 
 def kb_power_video_for_property(name: str) -> Optional[str]:
     key = normalize_property_key(name)
-    corr = KB.get("corrente", {})
-    return corr.get(key) or None
+    return KB.get("corrente", {}).get(key)
 
 # === Intent leggeri ===
 VIDEO_KEYWORDS = ("video", "accesso", "codice", "check-in", "checkin", "entrare", "self check")
@@ -220,54 +210,6 @@ def call_llm(messages, temperature=0.3) -> str:
 # === CiaoBooking bootstrap ===
 RES_ID_RE = re.compile(r"\b(\d{7,12})\b")
 
-def _cb_get_booking_context(phone: str, reservation_id: Optional[str]) -> Dict[str, Any]:
-    """
-    Wrapper robusto:
-    - usa CB.get_booking_context se esiste
-    - altrimenti fa il lookup 'a mano' (compat con client vecchi)
-    """
-    ctx: Dict[str, Any] = {"client": None, "reservation": None}
-
-    # 1) Se la classe ha il metodo ufficiale, delego
-    cb_method = getattr(CB, "get_booking_context", None)
-    if callable(cb_method):
-        return cb_method(phone=phone or None, reservation_id=reservation_id or None) or ctx
-
-    # 2) Fallback manuale (compat con client vecchi)
-    try:
-        # by reservation id
-        if reservation_id:
-            try:
-                res = CB.get_reservation(reservation_id)
-            except Exception:
-                res = None
-            if res:
-                try:
-                    norm = CB._normalize_reservation(res)  # type: ignore[attr-defined]
-                except Exception:
-                    norm = res
-                    if "property_name" not in norm:
-                        prop = (res.get("property") or {}).get("name")
-                        if prop:
-                            norm["property_name"] = prop
-                ctx["reservation"] = norm
-
-        # by phone -> client
-        if phone and not ctx.get("reservation"):
-            try:
-                raw = CB.search_clients_by_phone(phone)
-                coll = (raw.get("collection") if isinstance(raw, dict) else None) or []
-                client = coll[0] if coll else None
-                if client:
-                    ctx["client"] = client
-            except Exception:
-                pass
-
-        return ctx
-    except Exception as e:
-        logger.error("Errore fallback CiaoBooking: %s", e)
-        return ctx
-
 def get_booking_context(phone: str, text: str) -> Dict[str, Any]:
     reservation_id = None
     m = RES_ID_RE.search(text or "")
@@ -275,57 +217,80 @@ def get_booking_context(phone: str, text: str) -> Dict[str, Any]:
         reservation_id = m.group(1)
     tried = bool(reservation_id)
     found = False
-
+    ctx: Dict[str, Any] = {}
     try:
-        ctx = _cb_get_booking_context(phone, reservation_id)
+        ctx = CB.get_booking_context(phone=phone or None, reservation_id=reservation_id or None) or {}
         if reservation_id:
-            found = bool((ctx or {}).get("reservation"))
+            found = bool(ctx.get("reservation"))
     except Exception as e:
         logger.error("Errore lookup CiaoBooking: %s", e)
         ctx = {}
-
-    ctx = ctx or {}
     ctx.setdefault("_lookup", {})["rid_tried"] = reservation_id if tried else None
     ctx["_lookup"]["rid_found"] = found
     return ctx
 
 # === Core business reply ===
-def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
-    tlow = (text or "").strip().lower()
-
+def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Dict[str, Any]) -> str:
     # reset conv?
-    if tlow == "/reset":
+    if (text or "").strip().lower() == "/reset":
         session_store.pop(phone, None)
         return "✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Video/Accesso)"
 
-    # 0) Se abbiamo provato un reservation_id e non trovato -> chiedi subito la struttura
-    _lookup = (booking_ctx or {}).get("_lookup") or {}
-    if _lookup.get("rid_tried") and not _lookup.get("rid_found"):
-        return (
-            f"Non trovo la prenotazione {_lookup['rid_tried']}. "
-            "Per aiutarti subito, mi indichi il nome della struttura? "
-            "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
-        )
-
-    # 0-bis) Saluto personalizzato se abbiamo il nome e il messaggio è un saluto
-    client_name = ((booking_ctx.get("client") or {}).get("name") or "").strip()
-    if client_name and any(g in tlow for g in ["ciao", "buongiorno", "buonasera", "salve", "hey"]):
+    # saluto personalizzato se si riconosce il nome e il messaggio è un saluto
+    client_name = ((booking_ctx.get("client") or {}) if isinstance(booking_ctx, dict) else {}).get("name")
+    if client_name and any(greet in (text or "").lower() for greet in ["ciao", "buongiorno", "salve", "hey"]):
         first = client_name.split()[0]
-        return f"Ciao {first}! Come posso aiutarti oggi? Se hai bisogno di informazioni su transfer, parcheggio o accesso, fammi sapere!"
+        # non rispondiamo solo col saluto se l'utente ha già chiesto altro (gestito sotto)
 
-    # prova a determinare la property dal contesto, dal testo o dalla memoria
+    # property dal contesto o dal testo
     prop_from_ctx = property_name_from_ctx(booking_ctx)
     prop_from_text = extract_property_from_text(text)
-    last_prop = (session_store.get(phone) or {}).get("last_property")
-    prop = prop_from_ctx or prop_from_text or last_prop
+    prop = prop_from_ctx or prop_from_text
+
+    # --- Gestione memoria intenzione/property ---
+    # Se prima abbiamo chiesto la struttura per un intento specifico e ora l'utente ha mandato solo la property:
+    awaiting = session.get("awaiting_property_for")
+    if awaiting and prop_from_text and not wants_video(text) and not wants_power(text) and not wants_parking(text) and not wants_transfer(text):
+        # Completiamo l'intento pendente usando 'prop_from_text'
+        if awaiting == "video":
+            # blocco sicurezza
+            if explicit_access_request_blocked(booking_ctx):
+                session["awaiting_property_for"] = None
+                return (
+                    "Per motivi di sicurezza posso inviarti i link solo dopo la verifica dei documenti. "
+                    "Hai già inviato tutto? Se no, per favore mandaci:\n"
+                    "• Indirizzo di residenza\n"
+                    "• Foto dei documenti di identità (di tutti gli ospiti; oppure capogruppo + dati degli altri)\n"
+                    "Appena completato, potrò inviarti il video e le istruzioni di accesso."
+                )
+            vlink = kb_video_for_property(prop_from_text)
+            plink = kb_power_video_for_property(prop_from_text)
+            session["awaiting_property_for"] = None
+            if vlink or plink:
+                parts = []
+                if vlink:
+                    parts.append(f"Video check‑in — {prop_from_text}: {vlink}")
+                if plink:
+                    parts.append(f"Ripristino corrente — {prop_from_text}: {plink}")
+                return "\n".join(parts)
+            return "Sto cercando il video giusto per la tua struttura. Puoi confermare esattamente il nome dell’alloggio?"
+
+        if awaiting == "parking":
+            session["awaiting_property_for"] = None
+            return f"Parcheggio — {prop_from_text}: dimmi se hai esigenze particolari (orari/ingresso) e ti indico la soluzione migliore."
+
+        if awaiting == "transfer":
+            session["awaiting_property_for"] = None
+            return f"Perfetto, partenza o destinazione sarà {prop_from_text}. Quante persone e a che ora?"
 
     # 1) Richieste esplicite: video / corrente
     if wants_video(text) or wants_power(text):
+        session["last_intent"] = "video"
         if not prop:
+            session["awaiting_property_for"] = "video"
             return ("Per aiutarti, mi dici in quale struttura ti trovi? "
                     "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)")
 
-        # blocco solo se abbiamo reservation e check-in TO_DO
         if explicit_access_request_blocked(booking_ctx):
             return (
                 "Per motivi di sicurezza posso inviarti i link solo dopo la verifica dei documenti. "
@@ -358,22 +323,17 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
                 parts.append(f"Ripristino corrente: {plink}")
             return "\n".join(parts)
 
-    # 3) Transfer: raccogliamo dati base
+    # 3) Transfer
     if wants_transfer(text):
-        # persone
+        session["last_intent"] = "transfer"
+        t = (text or "").lower()
         people = None
-        m = re.search(r"\bsiamo in (\d{1,2})\b", tlow)
-        if not m:
-            m = re.search(r"\b(\d{1,2}) (persone|adulti|ospiti)\b", tlow)
+        m = re.search(r"\bsiamo in (\d{1,2})\b", t) or re.search(r"\b(\d{1,2}) (persone|adulti|ospiti)\b", t)
         if m:
             people = m.group(1)
-
-        # orario
         time_match = re.search(r"\b(\d{1,2})[:\.](\d{2})\b", text or "")
         when = f"{time_match.group(1)}:{time_match.group(2)}" if time_match else None
-
-        # partenza/destinazione (grezzo)
-        src = "aeroporto" if "aeroporto" in tlow else None
+        src = "aeroporto" if "aeroporto" in t else None
         dst = None
         if prop:
             dst = {
@@ -383,8 +343,6 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
                 "casa di gina": "Casa di Gina",
                 "villino di monic": "Villino di Monic",
             }.get(normalize_property_key(prop), prop)
-
-        # tariffa
         tariffa = None
         if (src and dst) and ("aeroporto" in (src or "")):
             tariffa = KB["transfer_tariffe"]["aeroporto_citta"]
@@ -398,16 +356,36 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
         parts.append(f"• Destinazione: {dst or '—'}")
         if tariffa:
             parts.append(f"\nTariffa: {tariffa}€.")
+        if not dst and not src:
+            session["awaiting_property_for"] = "transfer"
+            parts.append("\nPer completare, indicami il nome esatto della struttura (se è la destinazione).")
         parts.append("Confermi? (sì/no) In caso affermativo, Niccolò ti contatterà a breve.")
         return "\n".join(parts)
 
     # 4) Parcheggio
     if wants_parking(text):
+        session["last_intent"] = "parking"
         if not prop:
+            session["awaiting_property_for"] = "parking"
             return "In quale struttura soggiorni? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
         return f"Parcheggio — {prop}: dimmi se hai esigenze particolari (orari/ingresso) e ti indico la soluzione migliore."
 
-    # 5) Default: LLM con contesto
+    # 5) Messaggi generici su prenotazioni del tipo “a nome mio?”
+    t_low = (text or "").lower()
+    if "prenotazione" in t_low and any(k in t_low for k in ["mio", "nome mio", "a nome mio", "sul mio numero"]):
+        client = (booking_ctx or {}).get("client") or {}
+        if client:
+            rid_node = (booking_ctx or {}).get("_lookup") or {}
+            tried = rid_node.get("rid_tried")
+            found = rid_node.get("rid_found")
+            if tried and not found:
+                return f"Non trovo la prenotazione {tried}. Puoi indicarmi il nome della struttura? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
+            else:
+                return "Al momento non vedo prenotazioni recenti associate al tuo numero. Dimmi la struttura e ti aiuto subito con accesso, parcheggio o transfer."
+        else:
+            return "Per verificare meglio, mi indichi il nome della struttura? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
+
+    # 6) Default: LLM con contesto
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": f"KB transfer tariffs: {json.dumps(KB.get('transfer_tariffe', {}), ensure_ascii=False)}"},
@@ -415,7 +393,7 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
                                        "Se la struttura è ignota e serve per rispondere, chiedila.")},
         {"role": "user", "content": text or ""},
     ]
-    if booking_ctx and booking_ctx.get("reservation"):
+    if booking_ctx and isinstance(booking_ctx, dict) and booking_ctx.get("reservation"):
         res = booking_ctx["reservation"]
         human_res = {
             "status": res.get("status"),
@@ -428,20 +406,25 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
         }
         messages.insert(1, {"role": "system", "content": f"Reservation context: {json.dumps(human_res, ensure_ascii=False)}"})
 
+    # saluto personalizzato se applicabile (come primissima risposta in conversazioni generiche)
+    if client_name and any(greet in (text or "").lower() for greet in ["ciao", "buongiorno", "salve", "hey"]):
+        return f"Ciao {client_name.split()[0]}! Come posso aiutarti oggi? Se hai bisogno di informazioni su transfer, parcheggio o accesso, fammi sapere!"
+
     return call_llm(messages)
 
 def handle_incoming_message(phone: str, text: str) -> str:
-    # bootstrap session + booking ctx
-    session = session_store.setdefault(phone, {"history": [], "booking_ctx": None, "created_at": datetime.utcnow().isoformat()})
+    session = session_store.setdefault(phone, {
+        "history": [],
+        "booking_ctx": None,
+        "last_intent": None,
+        "awaiting_property_for": None,
+        "created_at": datetime.utcnow().isoformat()
+    })
+
     booking_ctx = get_booking_context(phone, text)
     session["booking_ctx"] = booking_ctx
 
-    # se l’utente nomina una struttura, memorizzala
-    mentioned_prop = extract_property_from_text(text)
-    if mentioned_prop:
-        session["last_property"] = mentioned_prop
-
-    answer = build_answer(phone, text, booking_ctx)
+    answer = build_answer(phone, text, booking_ctx, session)
     session["history"] = clamp_history(session["history"] + [
         {"role": "user", "content": text},
         {"role": "assistant", "content": answer},
@@ -470,7 +453,7 @@ def debug_ctx():
     if not phone and not rid:
         return jsonify({"error": "specify phone= or rid="}), 400
     try:
-        ctx = _cb_get_booking_context(phone=phone or "", reservation_id=rid or None)
+        ctx = CB.get_booking_context(phone=phone or None, reservation_id=rid or None)
         return jsonify({"ok": True, "ctx": ctx}), 200
     except Exception as e:
         logger.exception("debug_ctx error: %s", e)
@@ -547,15 +530,8 @@ async function send(){
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ phone: PHONE, message: t })
     });
-    let j;
-    const ct = r.headers.get('content-type') || '';
-    if (ct.includes('application/json')) {
-      j = await r.json();
-      add('bot', j.answer || j.reply || '(nessuna risposta)');
-    } else {
-      const txt = await r.text();
-      add('bot', 'Errore server: ' + txt.slice(0, 200));
-    }
+    const j = await r.json();
+    add('bot', j.answer || j.reply || '(nessuna risposta)');
   }catch(e){
     add('bot', 'Errore: ' + e);
   }
@@ -593,7 +569,6 @@ def test_api():
         logger.exception("Errore handle_incoming_message: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    # NB: il tester legge .answer
     return jsonify({"ok": True, "answer": reply_text}), 200
 
 # === Healthcheck / root ===
