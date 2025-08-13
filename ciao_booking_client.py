@@ -2,8 +2,9 @@
 import os
 import time
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
+from datetime import date, timedelta
 import requests
 
 log = logging.getLogger("ciaobooking")
@@ -45,10 +46,8 @@ class CiaoBookingClient:
         r = self._sess.post(url, json=payload, timeout=self.timeout)
         r.raise_for_status()
         data = r.json() if r.content else {}
-        # supporta sia {token, expires_at} che {data:{token, expires_at}}
         node = data.get("data", data)
         self._token = node.get("token")
-        # scadenza: usa expires_at se c’è; altrimenti 50 minuti
         expires_at = node.get("expires_at")
         if isinstance(expires_at, (int, float)):
             self._token_exp = float(expires_at)
@@ -68,7 +67,6 @@ class CiaoBookingClient:
         headers.setdefault("Accept-Language", self.locale)
         r = self._sess.request(method=method.upper(), url=url, headers=headers, timeout=self.timeout, **kwargs)
         if r.status_code == 401:
-            # token scaduto o non accettato: riprova una volta
             log.warning("401 su %s, ritento login…", path)
             self._login()
             headers.update(self._auth_headers())
@@ -82,7 +80,6 @@ class CiaoBookingClient:
 
     # ---------- Resources ----------
     def search_clients_by_phone(self, phone: str) -> Dict[str, Any]:
-        # CiaoBooking filtra per "search" (nome/email/telefono)
         params = {
             "limit": 5,
             "page": 1,
@@ -91,7 +88,7 @@ class CiaoBookingClient:
             "sortBy[]": "name",
         }
         data = self._get("/api/public/clients/paginated", params=params)
-        return data.get("data", data)  # compat
+        return data.get("data", data)
 
     def get_reservation(self, reservation_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -103,14 +100,81 @@ class CiaoBookingClient:
         node = data.get("data", data)
         return node or None
 
-    # ---------- High level used by app.py ----------
+    def list_reservations(
+        self,
+        from_date: str,
+        to_date: str,
+        status: Optional[str] = None,
+        property_id: Optional[int] = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        params = {
+            "from": from_date,
+            "to": to_date,
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        if status:
+            params["status"] = status  # es. "confirmed"
+        if property_id:
+            params["property_id"] = str(property_id)
+        data = self._get("/api/public/reservations", params=params)
+        return data.get("data", data)
+
+    def find_recent_reservation_for_client(
+        self,
+        client_id: int,
+        days_back: int = 30,
+        days_forward: int = 30,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Cerca una reservation CONFIRMED per client_id in una finestra temporale,
+        con priorità: in-corso/oggi > future più vicine > passate recenti.
+        """
+        today = date.today()
+        frm = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        to  = (today + timedelta(days=days_forward)).strftime("%Y-%m-%d")
+
+        raw = self.list_reservations(from_date=frm, to_date=to, status="confirmed", limit=200, offset=0)
+        coll = (raw.get("collection") if isinstance(raw, dict) else None) or []
+
+        candidates = []
+        for r in coll:
+            cid = r.get("client_id") or (r.get("client") or {}).get("id")
+            if cid == client_id:
+                candidates.append(r)
+
+        if not candidates:
+            return None
+
+        def k(res):
+            s = res.get("start_date")
+            e = res.get("end_date")
+            try:
+                ds = date.fromisoformat(s) if s else date.min
+                de = date.fromisoformat(e) if e else date.max
+            except Exception:
+                ds, de = date.min, date.max
+            if ds <= today < de or ds == today:
+                rank = 0
+            elif ds > today:
+                rank = 1
+            else:
+                rank = 2
+            return (rank, abs((ds - today).days))
+
+        candidates.sort(key=k)
+        return candidates[0]
+
+    # ---------- High level ----------
     def get_booking_context(
         self,
         phone: Optional[str] = None,
         reservation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Restituisce:
+        Ritorna:
         {
           "client": {...} | None,
           "reservation": {...} | None
@@ -118,18 +182,18 @@ class CiaoBookingClient:
         """
         ctx: Dict[str, Any] = {"client": None, "reservation": None}
 
-        # 1) Se ho un reservation_id, priorità alta
+        # (1) Reservation esplicita
         if reservation_id:
             res = self.get_reservation(reservation_id)
             if res:
                 ctx["reservation"] = self._normalize_reservation(res)
-                # prova a includere property_name se manca
                 if "property_name" not in ctx["reservation"]:
                     prop = (res.get("property") or {}).get("name")
                     if prop:
                         ctx["reservation"]["property_name"] = prop
 
-        # 2) Se ho un telefono, provo a cercare il client
+        # (2) Client da telefono
+        client = None
         if phone:
             try:
                 raw = self.search_clients_by_phone(phone)
@@ -139,17 +203,29 @@ class CiaoBookingClient:
                     ctx["client"] = client
             except requests.HTTPError as e:
                 log.error("Errore search_clients_by_phone: %s", e)
-                # Non rilancia: il bot deve continuare
+
+        # (3) Se ho client ma non ho reservation, cerco reservation recente CONFIRMED
+        if (not ctx.get("reservation")) and client and client.get("id"):
+            try:
+                found = self.find_recent_reservation_for_client(client_id=client["id"], days_back=30, days_forward=30)
+                if found:
+                    ctx["reservation"] = self._normalize_reservation(found)
+                    if "property_name" not in ctx["reservation"]:
+                        prop = (found.get("property") or {}).get("name")
+                        if prop:
+                            ctx["reservation"]["property_name"] = prop
+                    log.info("Reservation agganciata per client_id=%s: id=%s",
+                             client["id"], ctx["reservation"].get("id") or ctx["reservation"].get("res_id"))
+                else:
+                    log.info("Nessuna reservation recente per client_id=%s", client["id"])
+            except Exception as e:
+                log.error("Errore find_recent_reservation_for_client: %s", e)
 
         return ctx
 
     # ---------- Helpers ----------
     @staticmethod
     def _normalize_reservation(res: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Converte i codici numerici in label testuali (quando arrivano numeri).
-        Accetta anche payload già ‘stringificati’.
-        """
         status_map = {1: "CANCELED", 2: "CONFIRMED", 3: "PENDING"}
         guest_map = {0: "NOT_ARRIVED", 1: "ARRIVED", 2: "LEFT"}
         checkin_map = {0: "TO_DO", 1: "COMPLETED", 2: "VERIFIED"}
@@ -163,7 +239,6 @@ class CiaoBookingClient:
         out["status"] = _map(res.get("status"), status_map)
         out["guest_status"] = _map(res.get("guest_status"), guest_map)
         out["is_checkin_completed"] = _map(res.get("is_checkin_completed"), checkin_map)
-        # scorciatoie utili all'app
         if "property_name" not in out:
             name = (res.get("property") or {}).get("name")
             if name:
