@@ -5,105 +5,93 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Test Bot</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 20px; }
-    .row { display: flex; gap: 8px; margin-bottom: 8px; }
-    #log { border: 1px solid #ddd; padding: 10px; height: 60vh; overflow-y: auto; white-space: pre-wrap; }
-    .msg-me { color: #0b6; }
-    .msg-bot { color: #06c; }
-    .sys { color: #999; font-style: italic; }
-    input, button { font-size: 16px; padding: 8px; }
-    input[type="text"] { flex: 1; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 20px; }
+    #chat { border: 1px solid #ddd; border-radius: 8px; padding: 12px; height: 60vh; overflow-y: auto; background: #fafafa; }
+    .row { margin: 6px 0; }
+    .me { text-align: right; }
+    .me span { background: #d1f1ff; padding: 8px 10px; border-radius: 12px; display: inline-block; }
+    .bot span { background: #fff; padding: 8px 10px; border-radius: 12px; display: inline-block; }
+    #bar { display: flex; gap: 8px; margin-top: 10px; }
+    input,button { font-size: 16px; padding: 8px; }
+    #phone { width: 220px; }
+    #msg { flex: 1; }
   </style>
 </head>
 <body>
-  <div id="log"></div>
-
-  <div class="row">
-    <input id="phone" type="text" placeholder="Telefono (es. 3934...)" />
-    <button id="setPhone">Imposta</button>
+  <h2>Console di test</h2>
+  <div style="margin-bottom:8px;">
+    Telefono: <input id="phone" placeholder="Es. 3931234567" />
+    <button id="set">Imposta</button>
   </div>
 
-  <div class="row">
-    <input id="text" type="text" placeholder="Scrivi un messaggio..." />
+  <div id="chat"></div>
+
+  <div id="bar">
+    <input id="msg" placeholder="Scrivi un messaggio…" />
     <button id="send">Invia</button>
-    <button id="reset">Reset</button>
   </div>
 
   <script>
-    const log = document.getElementById('log');
+    const chat = document.getElementById('chat');
+    const input = document.getElementById('msg');
     const phoneInput = document.getElementById('phone');
-    const textInput = document.getElementById('text');
+    const btnSend = document.getElementById('send');
+    const btnSet = document.getElementById('set');
 
-    function addLine(html, cls="") {
-      const p = document.createElement('div');
-      p.className = cls;
-      p.innerHTML = html;
-      log.appendChild(p);
-      log.scrollTop = log.scrollHeight;
+    // ripristina/ricorda il numero
+    phoneInput.value = localStorage.getItem('test_phone') || '';
+
+    function addRow(who, text) {
+      const div = document.createElement('div');
+      div.className = 'row ' + who;
+      const span = document.createElement('span');
+      span.textContent = text;
+      div.appendChild(span);
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
     }
 
-    function getPhone() {
-      return localStorage.getItem('test_phone') || "";
-    }
-
-    function setPhone(p) {
+    btnSet.onclick = () => {
+      const p = phoneInput.value.trim();
+      if (!p) { alert('Inserisci il telefono'); return; }
       localStorage.setItem('test_phone', p);
-      addLine(`sys: Telefono impostato a ${p}`, 'sys');
-    }
-
-    // Init
-    (function() {
-      const p = getPhone();
-      if (p) phoneInput.value = p;
-      addLine('sys: Conversazione pronta. Inserisci telefono e invia il primo messaggio.', 'sys');
-    })();
-
-    document.getElementById('setPhone').onclick = () => {
-      const p = phoneInput.value.trim().replace(/^\+/, '');
-      if (!p) return;
-      setPhone(p);
+      addRow('bot', `Telefono impostato: ${p}. Scrivi un messaggio…`);
     };
 
-    document.getElementById('send').onclick = async () => {
-      const phone = getPhone();
-      const body = textInput.value.trim();
-      if (!phone || !body) {
-        addLine('sys: serve telefono e messaggio.', 'sys');
-        return;
-      }
-      addLine(`me: ${body}`, 'msg-me');
+    async function send() {
+      const phone = (phoneInput.value || '').trim();
+      const message = (input.value || '').trim();
+      if (!phone) { alert('Imposta il telefono'); return; }
+      if (!message) return;
+
+      addRow('me', message);
+      input.value = '';
 
       try {
-        const resp = await fetch('/test_api', {
+        const res = await fetch('/test_api', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ phone, body })
+          body: JSON.stringify({ phone, message })
         });
-        if (!resp.ok) {
-          const txt = await resp.text();
-          addLine(`sys: errore ${resp.status} - ${txt}`, 'sys');
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          addRow('bot', `Errore: ${data.error || res.statusText}`);
           return;
         }
-        const data = await resp.json();
-        addLine(`bot: ${data.reply}`, 'msg-bot');
+        addRow('bot', data.reply);
       } catch (e) {
-        addLine(`sys: errore di rete: ${e}`, 'sys');
-      } finally {
-        textInput.value = '';
+        addRow('bot', 'Errore di rete: ' + e.message);
       }
-    };
+    }
 
-    document.getElementById('reset').onclick = async () => {
-      const phone = getPhone();
-      if (!phone) { addLine('sys: imposta prima il telefono.', 'sys'); return; }
-      try {
-        const r = await fetch(`/reset_session?phone=${encodeURIComponent(phone)}`, { method: 'POST' });
-        if (r.ok) addLine('sys: sessione resettata.', 'sys');
-        else addLine(`sys: reset fallito (${r.status})`, 'sys');
-      } catch (e) {
-        addLine(`sys: errore di rete: ${e}`, 'sys');
-      }
-    };
+    btnSend.onclick = send;
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+    // messaggio di benvenuto
+    if (!chat.dataset.init) {
+      chat.dataset.init = '1';
+      addRow('bot', 'sys: Conversazione pronta. Inserisci telefono e invia il primo messaggio.');
+    }
   </script>
 </body>
 </html>
