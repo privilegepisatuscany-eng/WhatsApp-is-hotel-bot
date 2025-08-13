@@ -1,432 +1,288 @@
 import os
-import re
 import json
-import time
 import logging
-from datetime import datetime
-from typing import Dict, Any, List
+from datetime import datetime, date
+from typing import Dict, Any, Optional, List
 
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, render_template
+from twilio.twiml.messaging_response import MessagingResponse
 
-try:
-    # Se c'è il client, lo usiamo; altrimenti proseguiamo senza hard fail
-    from ciao_booking_client import CiaoBookingClient
-except Exception:  # pragma: no cover
-    CiaoBookingClient = None
+from ciao_booking_client import CiaoBookingClient
+from utils import normalize_sender, clamp_history, extract_reservation_id
 
-try:
-    # Se hai un utils.py va bene; altrimenti usiamo i fallback più sotto
-    from utils import normalize_sender as normalize_sender_ext  # type: ignore
-    from utils import clamp_history as clamp_history_ext  # type: ignore
-except Exception:
-    normalize_sender_ext = None
-    clamp_history_ext = None
-
-
-# ----------------- Logging -----------------
+# ---------------- Logging ----------------
 _level = os.environ.get("LOG_LEVEL", "INFO").upper()
-if _level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+if _level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
     _level = "INFO"
 logging.basicConfig(level=_level, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# ----------------- Flask -----------------
+# ---------------- Flask ----------------
 app = Flask(__name__)
 
+# ---------------- OpenAI via requests ----------------
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_BASE = os.environ.get("OPENAI_BASE", "https://api.openai.com/v1")
+OPENAI_CHAT_URL = f"{OPENAI_BASE}/chat/completions"
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
-# ----------------- Helpers (fallback) -----------------
-def normalize_sender(s: str) -> str:
-    """Normalizza un identificativo mittente in solo cifre (per WhatsApp è un telefono)."""
-    if normalize_sender_ext:
-        try:
-            return normalize_sender_ext(s)
-        except Exception:
-            pass
-    return re.sub(r"\D+", "", s or "")
+def call_openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        logger.debug("OpenAI payload: %s", payload)
+        r = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return content
+    except Exception as e:
+        logger.exception("OpenAI error: %s", e)
+        return "Mi dispiace, ho un problema tecnico momentaneo. Riprova tra poco."
 
-
-def clamp_history(hist: List[Dict[str, str]], max_items: int = 12) -> List[Dict[str, str]]:
-    """Taglia la history per non farla esplodere."""
-    if clamp_history_ext:
-        try:
-            return clamp_history_ext(hist, max_items=max_items)
-        except Exception:
-            pass
-    return hist[-max_items:] if len(hist) > max_items else hist
-
-
-def extract_intent(text: str) -> str:
-    """Grezzissimo router di intent per ridurre il numero di regole hardcoded."""
-    t = (text or "").lower()
-    if any(w in t for w in ["transfer", "trasfer", "trasnfer", "taxi", "ncc"]):
-        return "transfer"
-    if any(w in t for w in ["parcheggio", "parking", "parcheggiare"]):
-        return "parking"
-    if any(w in t for w in ["video", "accesso", "check in", "check-in", "codice", "self check"]):
-        return "access"
-    if any(w in t for w in ["corrente", "luce", "salta la corrente", "blackout"]):
-        return "power"
-    if any(w in t for w in ["check out", "checkout", "check-out"]):
-        return "checkout"
-    if any(w in t for w in ["colazione", "breakfast"]):
-        return "breakfast"
-    return "generic"
-
-
-# ----------------- OpenAI (senza SDK) -----------------
-def call_openai_chat(messages: List[Dict[str, str]],
-                     model: str = None,
-                     temperature: float = 0.3,
-                     timeout: int = 30) -> str:
-    """Chiama l'endpoint Chat Completions con requests, evitando l’SDK (fix al problema proxies)."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY mancante")
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-        "messages": messages,
-        "temperature": temperature,
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"].strip()
-
-
-# ----------------- Knowledge Base -----------------
+# ---------------- Knowledge Base ----------------
 def load_kb() -> Dict[str, Any]:
-    path = os.environ.get("KB_PATH", "knowledge_base.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            kb = json.load(f)
-            logger.info("KB caricata da %s", path)
-            return kb
-    except FileNotFoundError:
-        logger.warning("KB non trovata (%s). Procedo con KB vuota.", path)
+    path = os.path.join(os.getcwd(), "knowledge_base.json")
+    if not os.path.exists(path):
+        logger.warning("knowledge_base.json non trovato, uso KB vuota.")
         return {}
-    except Exception as e:
-        logger.error("Errore caricando KB: %s", e)
-        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
+KB = load_kb()
 
-KB: Dict[str, Any] = load_kb()
+def choose_video_link(property_name: str) -> Optional[str]:
+    if not property_name:
+        return None
+    p = property_name.strip().lower()
+    for k, v in (KB.get("videos") or {}).items():
+        if k.lower() == p:
+            return v
+    return None
 
-# Prepara un “riassunto” KB per il system prompt (limite semplice)
-def kb_to_prompt(kb: Dict[str, Any], max_len: int = 10000) -> str:
-    try:
-        txt = json.dumps(kb, ensure_ascii=False)
-        if len(txt) > max_len:
-            txt = txt[:max_len] + " …"
-        return txt
-    except Exception:
-        return ""
-
-
-KB_SNIPPET = kb_to_prompt(KB)
-
-
-# ----------------- CiaoBooking -----------------
-CB = None
-if CiaoBookingClient:
-    try:
-        CB = CiaoBookingClient(
-            base_url=os.environ.get("CIAOBOOKING_BASE_URL", "https://api.ciaobooking.com"),
-            email=os.environ.get("CIAOBOOKING_EMAIL", ""),
-            password=os.environ.get("CIAOBOOKING_PASSWORD", ""),
-            locale=os.environ.get("CIAOBOOKING_LOCALE", "it"),
-        )
-        logger.info("CiaoBooking client inizializzato.")
-    except Exception as e:
-        logger.error("CiaoBooking init fallita: %s", e)
-
-
-def cb_lookup_once(session: Dict[str, Any], phone: str, user_text: str) -> None:
-    """Al primo messaggio per un numero, prova a risolvere il cliente e la prenotazione."""
-    if session.get("booking_checked"):
-        return
-    session["booking_checked"] = True
-    session.setdefault("booking_ctx", {})
-
-    if not CB:
-        logger.info("CiaoBooking non disponibile (client mancante). Skip lookup.")
-        return
-
-    try:
-        client = CB.find_client_by_phone(phone)
-        if client:
-            session["booking_ctx"]["client"] = client
-            logger.info("CiaoBooking: client risolto per %s", phone)
-        else:
-            logger.info("CiaoBooking: client non trovato (%s)", phone)
-    except Exception as e:
-        logger.error("Errore lookup client CiaoBooking: %s", e)
-
-    # Se l’utente ha scritto un numero di prenotazione, proviamo a prenderla
-    m = re.search(r"\b(\d{6,})\b", user_text or "")
-    if m:
-        res_id = m.group(1)
-        try:
-            res = CB.get_reservation_by_id(res_id)
-            if res:
-                session["booking_ctx"]["reservation"] = res
-                logger.info("CiaoBooking: reservation %s risolta", res_id)
-        except Exception as e:
-            logger.error("CiaoBooking reservation error: %s", e)
-
-
-# ----------------- Stato conversazioni -----------------
-# session_store[phone] = {
-#   "history": [{"role": "user"/"assistant"/"system", "content": "..."}],
-#   "booking_checked": bool,
-#   "booking_ctx": {...},
-#   "topic": "transfer|parking|access|power|generic",
-#   "transfer_draft": {"people":..., "time":..., "from":..., "to":...},
-# }
-session_store: Dict[str, Dict[str, Any]] = {}
-
-
-SYSTEM_INSTRUCTIONS = (
-    "Sei un assistente per strutture ricettive a Pisa. "
-    "Parla in modo chiaro, cortese e conciso. "
-    "Usa SOLO la KB e/o i dati prenotazione disponibili; non inventare. "
-    "Tariffe transfer: Aeroporto ↔ Città 50€, Città ↔ Città 40€. "
-    "Se l’utente chiede transfer, raccogli dati: persone, orario, partenza, destinazione. "
-    "Per parcheggio, chiedi o deduci la struttura e rispondi con info specifiche dalla KB. "
-    "Per corrente/blackout alla 'Casa Monic' ricorda: quadro in cucina; se non torna, quadro generale al portone verde (cassetta posta, contatore COSCI). "
-    "Se ci sono video in KB relativi alla struttura richiesta, condividi il link. "
-    "Evita di ripartire da capo dopo una conferma: prosegui nel flusso in corso."
+# ---------------- CiaoBooking ----------------
+CB = CiaoBookingClient(
+    base_url="https://api.ciaobooking.com",
+    email=os.environ.get("CIAOBOOKING_EMAIL", ""),
+    password=os.environ.get("CIAOBOOKING_PASSWORD", ""),
+    locale=os.environ.get("CIAOBOOKING_LOCALE", "it"),
 )
 
+# ---------------- Memoria in RAM ----------------
+# session_store[phone] = {"history":[...], "booking_ctx":{...}, "created_at": iso}
+session_store: Dict[str, Dict[str, Any]] = {}
 
-def build_messages(session: Dict[str, Any], user_text: str) -> List[Dict[str, str]]:
-    """Costruisce il contesto conversazionale per il modello."""
-    history = session.get("history", [])
-    booking_ctx = session.get("booking_ctx", {})
-    ctx_str = json.dumps(booking_ctx, ensure_ascii=False) if booking_ctx else "{}"
+def get_session(phone: str) -> Dict[str, Any]:
+    sess = session_store.get(phone)
+    if not sess:
+        sess = {"history": [], "created_at": datetime.utcnow().isoformat()}
+        session_store[phone] = sess
+    return sess
 
-    system = (
-        SYSTEM_INSTRUCTIONS +
-        "\n\n[KB]\n" + (KB_SNIPPET or "") +
-        "\n\n[Prenotazione]\n" + ctx_str
-    )
+# ---------------- Booking context helpers ----------------
+STATUS_MAP = {1: "CANCELED", 2: "CONFIRMED", 3: "PENDING"}
+GUEST_STATUS_MAP = {0: "NOT_ARRIVED", 1: "ARRIVED", 2: "LEFT"}
+CHECKIN_DONE_MAP = {0: "TO_DO", 1: "COMPLETED", 2: "VERIFIED"}
 
-    msgs = [{"role": "system", "content": system}]
-    msgs.extend(history[-8:])  # un po’ di contesto recente
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
-
-
-def postprocess_reply(text: str, session: Dict[str, Any], user_text: str) -> str:
-    """Piccoli fix: aggiungi video se l’utente ha chiesto e la KB ce l’ha."""
-    t = (user_text or "").lower()
-
-    # Se domanda video + struttura
-    if any(w in t for w in ["video", "accesso", "check in", "check-in", "self check"]):
-        # Trova struttura citata
-        structures = ["Relais dell’Ussero", "Casa Monic", "Belle Vue", "Villino di Monic", "Casa di Gina",
-                      "relais", "ussero", "monic", "belle vue", "gina", "villino"]
-        found = None
-        for s in structures:
-            if s.lower() in t:
-                found = s
-                break
-
-        # Cerca in KB eventuali video
-        videos = KB.get("videos") or KB.get("video") or {}
-        if found and videos:
-            # normalizza chiavi
-            for k, payload in videos.items():
-                if k.lower() in found.lower() or found.lower() in k.lower():
-                    # scegli `checkin` o link generico
-                    link = payload.get("checkin") or payload.get("selfcheckin") or payload.get("url") or ""
-                    if link:
-                        text += f"\n\n🎥 Video accesso ({k}): {link}"
-                    # power/reset
-                    power = payload.get("power") or payload.get("corrente")
-                    if power and any(w in t for w in ["corrente", "luce", "blackout"]):
-                        text += f"\n🔌 Ripristino corrente ({k}): {power}"
-                    break
-
-    # Se parla di corrente + Casa Monic, assicurati che la sequenza base ci sia
-    if "casa monic" in t and any(w in t for w in ["corrente", "luce", "blackout"]):
-        if "COSCI" not in text and "Cosci" not in text:
-            text += (
-                "\n\n➕ Promemoria: se non torna la luce, controlla il quadro generale "
-                "accanto al portone verde nelle cassette della posta. Contatore con scritto *COSCI*."
-            )
-
-    return text
-
-
-def respond_text(sender: str, user_text: str) -> str:
-    """Flusso principale: lookup CB una sola volta, LLM con KB+ctx, stato conversazione."""
-    session = session_store.setdefault(sender, {"history": [], "booking_checked": False})
-
-    # Lookup CB solo al primo messaggio della sessione
+def _parse_ymd(d: Optional[str]) -> Optional[date]:
+    if not d:
+        return None
     try:
-        cb_lookup_once(session, sender, user_text)
-    except Exception as e:
-        logger.error("cb_lookup_once errore: %s", e)
+        return datetime.strptime(d, "%Y-%m-%d").date()
+    except Exception:
+        try:
+            return datetime.strptime(d[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
 
-    # Intent light (solo per non perdere il filo)
-    if "topic" not in session or not session["topic"] or extract_intent(user_text) != "generic":
-        session["topic"] = extract_intent(user_text)
+def should_offer_checkin_assets(booking_ctx: Dict[str, Any]) -> bool:
+    res = (booking_ctx.get("reservation") or {})
+    if not res:
+        return False
+    if res.get("status") != "CONFIRMED":
+        return False
+    if res.get("guest_status") not in ("NOT_ARRIVED",):
+        return False
+    if res.get("is_checkin_completed") not in ("TO_DO",):
+        return False
+    d_start = _parse_ymd(res.get("start_date"))
+    d_end = _parse_ymd(res.get("end_date"))
+    if not d_start:
+        return False
+    today = date.today()
+    if today == d_start:
+        return True
+    if d_end and d_start <= today < d_end:
+        return True
+    return False
 
-    # Costruisci messaggi per il modello
-    messages = build_messages(session, user_text)
+def build_booking_context(phone: str, user_text: str) -> Dict[str, Any]:
+    sess = get_session(phone)
+    if "booking_ctx" in sess:
+        return sess["booking_ctx"]
 
-    # Chiamata modello
-    reply = call_openai_chat(messages, temperature=0.3)
+    ctx: Dict[str, Any] = {}
+    # 1) prova da reservation id nel testo
+    res_id = extract_reservation_id(user_text)
+    if res_id:
+        res = CB.get_reservation_by_id(res_id)
+        if res:
+            status_i = res.get("status")
+            guest_status_i = res.get("guest_status")
+            checkin_i = res.get("is_checkin_completed")
 
-    # Postprocess (aggiunta link video se rilevati)
-    reply = postprocess_reply(reply, session, user_text)
+            ctx["reservation"] = {
+                "id": res.get("id"),
+                "status_code": status_i,
+                "status": STATUS_MAP.get(status_i, str(status_i)),
+                "guest_status_code": guest_status_i,
+                "guest_status": GUEST_STATUS_MAP.get(guest_status_i, str(guest_status_i)),
+                "is_checkin_completed_code": checkin_i,
+                "is_checkin_completed": CHECKIN_DONE_MAP.get(checkin_i, str(checkin_i)),
+                "start_date": res.get("start_date"),
+                "end_date": res.get("end_date"),
+                "property_id": res.get("property_id"),
+                "room_type_id": res.get("room_type_id"),
+                "guests": res.get("guests"),
+                "arrival_time": res.get("arrival_time"),
+                "checkout_time": res.get("checkout_time"),
+            }
+            prop = None
+            if res.get("property_id"):
+                prop = CB.get_property(res["property_id"])
+            if prop:
+                ctx["property"] = {"id": prop.get("id"), "name": prop.get("name")}
+            sess["booking_ctx"] = ctx
+            return ctx
 
-    # Aggiorna history
-    session["history"] = clamp_history(session.get("history", []) + [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": reply},
+    # 2) client da telefono
+    cli = CB.get_client_by_phone(phone)
+    if cli:
+        ctx["client"] = {
+            "id": cli.get("id"),
+            "name": cli.get("name"),
+            "phone": cli.get("phone"),
+        }
+        sess["booking_ctx"] = ctx
+        return ctx
+
+    sess["booking_ctx"] = ctx
+    return ctx
+
+# ---------------- Prompt ----------------
+BASE_SYSTEM_PROMPT = """
+Sei un assistente per strutture ricettive a Pisa.
+Stile: chiaro, cordiale, conciso. Fai al massimo UNA domanda mirata quando serve.
+Usa SOLO la Knowledge Base (KB) e gli eventuali dati di prenotazione forniti in CONTEXT; non inventare.
+
+Regole:
+- Se CONTEXT.reservation.status = CONFIRMED e (guest_status = NOT_ARRIVED) e (is_checkin_completed = TO_DO)
+  e oggi è il giorno di arrivo (o soggiorno in corso), fornisci PROATTIVAMENTE i link di self check‑in/accesso
+  dalla KB relativi alla property, senza aspettare che l’utente li chieda.
+- *Taxi/Transfer*: chiedi solo i dati mancanti tra persone, orario, partenza, destinazione.
+  Tariffe: Aeroporto↔Città 50€, altrimenti 40€.
+- *Parcheggio*: se manca la struttura, chiedila e poi rispondi in base alla KB.
+- *Video/Accesso/Corrente*: se c’è la struttura nel CONTEXT o viene indicata dall’utente, restituisci il link corretto dalla KB.
+- Se l’utente invia '/reset', conferma il reset e basta.
+
+Knowledge Base (JSON):
+""".strip()
+
+def build_system_message(kb: Dict[str, Any], booking_ctx: Dict[str, Any]) -> Dict[str, str]:
+    kb_json = json.dumps(kb, ensure_ascii=False, indent=2)
+    ctx_json = json.dumps(booking_ctx, ensure_ascii=False)
+    content = f"{BASE_SYSTEM_PROMPT}\n{kb_json}\n\nCONTEXT:\n{ctx_json}"
+    return {"role": "system", "content": content}
+
+# ---------------- Risposta assistente ----------------
+def make_assistant_reply(phone: str, user_text: str) -> str:
+    sess = get_session(phone)
+
+    # reset
+    if user_text.strip().lower() == "/reset":
+        session_store.pop(phone, None)
+        return "✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Video/Accesso)"
+
+    # context
+    booking_ctx = build_booking_context(phone, user_text)
+
+    # history (max)
+    hist = clamp_history(sess.get("history", []), max_pairs=6)
+
+    messages = [build_system_message(KB, booking_ctx)] + hist + [{"role": "user", "content": user_text}]
+    answer = call_openai_chat(messages, temperature=0.2)
+
+    # Post-processing per link video/accesso/corrente
+    lower = user_text.lower()
+    property_name = (booking_ctx.get("property", {}) or {}).get("name")
+    wants_access = any(x in lower for x in [
+        "come entro", "come faccio a entrare", "self check", "self-check",
+        "video", "accesso", "codice porta", "corrente", "check in", "check-in"
     ])
 
-    return reply
+    # Spinta automatica se condizioni ok
+    if property_name and should_offer_checkin_assets(booking_ctx):
+        link = choose_video_link(property_name)
+        if link and link not in answer:
+            answer = (answer + f"\n\n🔑 Accesso per *{property_name}*: {link}").strip()
+    # Su richiesta esplicita
+    elif property_name and wants_access:
+        link = choose_video_link(property_name)
+        if link and link not in answer:
+            answer = (answer + f"\n\n🔗 Video per *{property_name}*: {link}").strip()
 
+    # salva history
+    sess["history"] = hist + [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": answer},
+    ]
+    session_store[phone] = sess
+    return answer
 
-def make_twiliml(text: str) -> str:
-    """TwiML minimale senza dipendenze se vuoi evitare twilio SDK; ma noi abbiamo già twilio nel reqs."""
-    try:
-        from twilio.twiml.messaging_response import MessagingResponse
-        r = MessagingResponse()
-        r.message(text)
-        return str(r)
-    except Exception:
-        # Fallback ultra minimale
-        return f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{text}</Message></Response>'
-
-
-# ----------------- Routes -----------------
-@app.route("/", methods=["GET"])
-def index():
-    return "OK", 200
-
-
-TEST_HTML = """
-<!doctype html>
-<html lang="it">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Test Chat – Privilege Pisa</title>
-<style>
-body { font-family: system-ui, Arial, sans-serif; margin: 0; background:#f6f6f8; }
-.container { max-width: 820px; margin: 24px auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.07); overflow: hidden; }
-.header { padding: 16px 20px; border-bottom: 1px solid #eee; display:flex; gap:12px; align-items:center; }
-.header input { padding:10px 12px; border:1px solid #ddd; border-radius:8px; outline:none; }
-.header button { padding:10px 14px; border:none; background:#111827; color:#fff; border-radius:8px; cursor:pointer; }
-.chat { padding: 16px 20px; height: 60vh; overflow-y: auto; background: #fafafa; }
-.msg { margin: 10px 0; display:flex; }
-.msg.me { justify-content: flex-end; }
-.bubble { max-width: 70%; padding: 10px 12px; border-radius: 12px; }
-.me .bubble { background:#111827; color:#fff; border-bottom-right-radius: 4px; }
-.bot .bubble { background:#e5e7eb; color:#111827; border-bottom-left-radius: 4px; }
-.footer { padding: 16px 20px; border-top:1px solid #eee; display:flex; gap:10px; }
-.footer input { flex:1; padding:12px; border:1px solid #ddd; border-radius:10px; outline:none; }
-.footer button { padding:12px 16px; border:none; background:#111827; color:#fff; border-radius:10px; cursor:pointer; }
-.small { font-size:12px; color:#6b7280; }
-</style>
-<div class="container">
-  <div class="header">
-    <div><strong>Test Chat</strong> <span class="small">– Inserisci numero telefono (solo cifre)</span></div>
-    <input id="phone" placeholder="es. 393470416638" />
-    <button onclick="setPhone()">Usa numero</button>
-  </div>
-  <div id="chat" class="chat"></div>
-  <div class="footer">
-    <input id="text" placeholder="Scrivi un messaggio..." onkeydown="if(event.key==='Enter')send()"/>
-    <button onclick="send()">Invia</button>
-  </div>
-</div>
-<script>
-let phone = "";
-const chat = document.getElementById('chat');
-
-function setPhone(){
-  const p = document.getElementById('phone').value.trim();
-  if(!p){ alert('Inserisci un numero'); return; }
-  phone = p.replace(/\\D+/g,'');
-  add('bot','✅ Conversazione pronta. Inserisci telefono e invia il primo messaggio.');
-}
-
-function add(who, text){
-  const wrap = document.createElement('div');
-  wrap.className = 'msg ' + who;
-  const b = document.createElement('div');
-  b.className = 'bubble';
-  b.textContent = text;
-  wrap.appendChild(b);
-  chat.appendChild(wrap);
-  chat.scrollTop = chat.scrollHeight;
-}
-
-async function send(){
-  const t = document.getElementById('text').value.trim();
-  if(!t){ return; }
-  if(!phone){ alert('Prima imposta il numero'); return; }
-  add('me', t);
-  document.getElementById('text').value = '';
-  try{
-    const r = await fetch('/webhook', {
-      method:'POST',
-      headers:{'Content-Type':'application/json','X-Test-Client':'1'},
-      body: JSON.stringify({ phone: phone, body: t })
-    });
-    const data = await r.json();
-    add('bot', data.reply || '(nessuna risposta)');
-  }catch(e){
-    add('bot', 'Errore: ' + e);
-  }
-}
-</script>
-"""
+# ---------------- Test UI ----------------
+@app.route("/")
+def root():
+    return "OK"
 
 @app.route("/test", methods=["GET"])
 def test_page():
-    return Response(TEST_HTML, mimetype="text/html")
+    return render_template("test.html")
 
+@app.route("/test_api", methods=["POST"])
+def test_api():
+    phone = normalize_sender(request.form.get("phone") or "")
+    text = (request.form.get("text") or "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "missing phone"}), 400
+    if not text:
+        return jsonify({"ok": False, "error": "missing text"}), 400
 
+    logger.debug("TEST Inbound da %s: %s", phone, text)
+    reply = make_assistant_reply(phone, text)
+    return jsonify({"ok": True, "reply": reply})
+
+# ---------------- Twilio webhook ----------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    - Se arriva da Twilio: form-encoded con 'From' e 'Body' -> risponde in TwiML.
-    - Se arriva dal tester: JSON {phone, body} + header X-Test-Client: 1 -> risponde JSON.
-    """
-    is_test = request.headers.get("X-Test-Client") == "1" or request.is_json
-
-    if is_test:
-        data = request.get_json(silent=True) or {}
-        sender = normalize_sender(str(data.get("phone", "")))
-        body = (data.get("body") or "").strip()
-    else:
-        sender_raw = request.form.get("From", "")
-        body = (request.form.get("Body") or "").strip()
-        sender = normalize_sender(sender_raw)
-
+    sender_raw = request.form.get("From", "")
+    body = (request.form.get("Body") or "").strip()
+    sender = normalize_sender(sender_raw)
     logger.debug("Inbound da %s: %s", sender, body)
 
-    if not sender:
-        out = "Numero non valido. Inserisci un numero di telefono (solo cifre)."
-        if is_test:
-            return jsonify({"reply": out})
-        return make_twiliml(out)
+    reply = make_assistant_reply(sender, body)
+    twiml = MessagingResponse()
+    twiml.message(reply)
+    return str(twiml)
 
-    try:
-        reply = respond_text(sender, body)
-    except Exception as e:
-        logger.exception("Errore in respond_text: %s", e)
-        reply = "Mi dispiace, c'è stato un problema temporaneo. Riprova tra poco."
-
-    if is_test:
-        return jsonify({"reply": reply})
-    else:
-        return make_twiliml(reply)
+# ---------------- Run (locale) ----------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
