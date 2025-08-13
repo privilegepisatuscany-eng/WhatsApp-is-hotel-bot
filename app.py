@@ -20,7 +20,7 @@ logger = logging.getLogger("bot")
 # === Flask ===
 app = Flask(__name__)
 
-# === OpenAI client (senza proxies) ===
+# === OpenAI client ===
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or ""
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY non impostata: risposte fallback.")
@@ -74,9 +74,9 @@ CB = CiaoBookingClient(
 # session_store[phone] = {
 #   "history": [...],
 #   "booking_ctx": {...},
-#   "last_intent": "video"|"parking"|"transfer"|None,
-#   "awaiting_property_for": "video"|"parking"|None,
-#   "created_at": ISO
+#   "created_at": ISO,
+#   "pending_confirm": {...} | None,
+#   "reservation_confirmed": bool
 # }
 session_store: Dict[str, Dict[str, Any]] = {}
 
@@ -98,11 +98,9 @@ def _parse_ymd(d: Optional[str]) -> Optional[date]:
     if not d:
         return None
     try:
-        if len(d) >= 10:
-            return date.fromisoformat(d[:10])
+        return date.fromisoformat(d[:10])
     except Exception:
-        pass
-    return None
+        return None
 
 # === Politiche video/accesso ===
 def should_offer_checkin_assets_auto(booking_ctx: Dict[str, Any]) -> bool:
@@ -134,7 +132,7 @@ def explicit_access_request_blocked(booking_ctx: Dict[str, Any]) -> bool:
 
 # === Property helpers ===
 ALIASES = {
-    "casa monic": ["casa monic", "monic", "casa di monic"],
+    "casa monic": ["casa monic", "monic", "casa di monic", "casa di monic", "villino di monic?"],
     "relais dell’ussero": ["relais", "ussero", "relais dell'ussero", "relais dell’ussero"],
     "belle vue": ["belle vue", "bellevue"],
     "casa di gina": ["casa di gina", "gina"],
@@ -155,26 +153,25 @@ def extract_property_from_text(text: str) -> Optional[str]:
     return None
 
 def property_name_from_ctx(booking_ctx: Dict[str, Any]) -> Optional[str]:
-    res = (booking_ctx or {}).get("reservation") | {}
-    if isinstance(res, dict):
-        prop = (res.get("property") or {}).get("name") or res.get("property_name")
-    else:
-        prop = None
+    res = (booking_ctx or {}).get("reservation") or {}
+    prop = (res.get("property") or {}).get("name") or res.get("property_name")
     return prop.strip() if prop else None
 
 def kb_video_for_property(name: str) -> Optional[str]:
     key = normalize_property_key(name)
-    return KB.get("videos", {}).get(key)
+    return KB.get("videos", {}).get(key) or None
 
 def kb_power_video_for_property(name: str) -> Optional[str]:
     key = normalize_property_key(name)
-    return KB.get("corrente", {}).get(key)
+    return KB.get("corrente", {}).get(key) or None
 
 # === Intent leggeri ===
 VIDEO_KEYWORDS = ("video", "accesso", "codice", "check-in", "checkin", "entrare", "self check")
 POWER_KEYWORDS = ("corrente", "luce", "elettric", "power")
 TRANSFER_KEYWORDS = ("transfer", "taxi", "trasfer", "trasporto")
 PARKING_KEYWORDS = ("parcheggio", "park", "auto", "sosta")
+YES_WORDS = ("si", "sì", "ok", "va bene", "certo", "confermo", "yes")
+NO_WORDS = ("no", "non", "negativo")
 
 def wants_video(text: str) -> bool:
     t = (text or "").lower()
@@ -191,6 +188,14 @@ def wants_transfer(text: str) -> bool:
 def wants_parking(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in PARKING_KEYWORDS)
+
+def is_yes(text: str) -> bool:
+    t = (text or "").lower().strip()
+    return any(t.startswith(w) or t == w for w in YES_WORDS)
+
+def is_no(text: str) -> bool:
+    t = (text or "").lower().strip()
+    return any(t == w for w in NO_WORDS)
 
 # === OpenAI wrapper ===
 def call_llm(messages, temperature=0.3) -> str:
@@ -217,7 +222,7 @@ def get_booking_context(phone: str, text: str) -> Dict[str, Any]:
         reservation_id = m.group(1)
     tried = bool(reservation_id)
     found = False
-    ctx: Dict[str, Any] = {}
+    ctx = {}
     try:
         ctx = CB.get_booking_context(phone=phone or None, reservation_id=reservation_id or None) or {}
         if reservation_id:
@@ -236,61 +241,88 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
         session_store.pop(phone, None)
         return "✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Video/Accesso)"
 
-    # saluto personalizzato se si riconosce il nome e il messaggio è un saluto
-    client_name = ((booking_ctx.get("client") or {}) if isinstance(booking_ctx, dict) else {}).get("name")
-    if client_name and any(greet in (text or "").lower() for greet in ["ciao", "buongiorno", "salve", "hey"]):
-        first = client_name.split()[0]
-        # non rispondiamo solo col saluto se l'utente ha già chiesto altro (gestito sotto)
+    # Saluto personalizzato quando arriva un saluto & abbiamo il nome
+    client_name = ((booking_ctx.get("client") or {}).get("name") or "").strip()
+    is_greeting = any(g in (text or "").lower() for g in ["ciao", "buongiorno", "salve", "hey"])
+    if is_greeting and client_name:
+        # Se abbiamo anche una reservation non ancora confermata nella sessione → proponi conferma
+        res = (booking_ctx.get("reservation") or {})
+        prop = property_name_from_ctx(booking_ctx)
+        if res and prop:
+            start = (res.get("start_date") or "")[:10]
+            end = (res.get("end_date") or "")[:10]
+            session["pending_confirm"] = {
+                "prop": prop,
+                "start": start,
+                "end": end,
+                "reservation_id": res.get("id"),
+            }
+            session["reservation_confirmed"] = False
+            return f"Ciao {client_name.split()[0]}! Confermi che la tua prenotazione è presso *{prop}* dal *{start}* al *{end}*?"
+        # altrimenti semplice saluto
+        return f"Ciao {client_name.split()[0]}! Come posso aiutarti oggi? Se hai bisogno di informazioni su transfer, parcheggio o accesso, fammi sapere!"
 
-    # property dal contesto o dal testo
+    # Gestisci conferma prenotazione
+    if session.get("pending_confirm"):
+        if is_yes(text):
+            session["reservation_confirmed"] = True
+            confirm = session["pending_confirm"]
+            prop = confirm["prop"]
+            # con conferma, se policy OK invia link automatici
+            # controlla stato check-in
+            res = (booking_ctx.get("reservation") or {})
+            chk = (res.get("is_checkin_completed") or "").upper()
+            parts = [f"Perfetto! Prenotazione confermata per *{prop}*."]
+            if chk in ("COMPLETED", "VERIFIED"):
+                v = kb_video_for_property(prop)
+                p = kb_power_video_for_property(prop)
+                if v:
+                    parts.append(f"Video check‑in: {v}")
+                if p:
+                    parts.append(f"Ripristino corrente: {p}")
+                parts.append("Se ti serve *Parcheggio* o *Transfer*, dimmelo pure.")
+            else:
+                parts.append(
+                    "Per motivi di sicurezza posso inviare i link di accesso dopo la verifica documenti.\n"
+                    "Hai già inviato:\n"
+                    "• Indirizzo di residenza\n"
+                    "• Foto documenti per tutti gli ospiti (oppure solo capogruppo + dati degli altri)?"
+                )
+            # consumiamo la pending
+            session["pending_confirm"] = None
+            return "\n".join(parts)
+        elif is_no(text):
+            session["pending_confirm"] = None
+            session["reservation_confirmed"] = False
+            return ("Nessun problema. Per aiutarti, mi dici in quale struttura ti trovi? "
+                    "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)")
+
+    # prova a determinare la property dal contesto o dal testo
     prop_from_ctx = property_name_from_ctx(booking_ctx)
     prop_from_text = extract_property_from_text(text)
     prop = prop_from_ctx or prop_from_text
 
-    # --- Gestione memoria intenzione/property ---
-    # Se prima abbiamo chiesto la struttura per un intento specifico e ora l'utente ha mandato solo la property:
-    awaiting = session.get("awaiting_property_for")
-    if awaiting and prop_from_text and not wants_video(text) and not wants_power(text) and not wants_parking(text) and not wants_transfer(text):
-        # Completiamo l'intento pendente usando 'prop_from_text'
-        if awaiting == "video":
-            # blocco sicurezza
-            if explicit_access_request_blocked(booking_ctx):
-                session["awaiting_property_for"] = None
-                return (
-                    "Per motivi di sicurezza posso inviarti i link solo dopo la verifica dei documenti. "
-                    "Hai già inviato tutto? Se no, per favore mandaci:\n"
-                    "• Indirizzo di residenza\n"
-                    "• Foto dei documenti di identità (di tutti gli ospiti; oppure capogruppo + dati degli altri)\n"
-                    "Appena completato, potrò inviarti il video e le istruzioni di accesso."
-                )
-            vlink = kb_video_for_property(prop_from_text)
-            plink = kb_power_video_for_property(prop_from_text)
-            session["awaiting_property_for"] = None
-            if vlink or plink:
-                parts = []
-                if vlink:
-                    parts.append(f"Video check‑in — {prop_from_text}: {vlink}")
-                if plink:
-                    parts.append(f"Ripristino corrente — {prop_from_text}: {plink}")
-                return "\n".join(parts)
-            return "Sto cercando il video giusto per la tua struttura. Puoi confermare esattamente il nome dell’alloggio?"
-
-        if awaiting == "parking":
-            session["awaiting_property_for"] = None
-            return f"Parcheggio — {prop_from_text}: dimmi se hai esigenze particolari (orari/ingresso) e ti indico la soluzione migliore."
-
-        if awaiting == "transfer":
-            session["awaiting_property_for"] = None
-            return f"Perfetto, partenza o destinazione sarà {prop_from_text}. Quante persone e a che ora?"
+    # Se l'utente manda un ID prenotazione inesistente → messaggio dedicato
+    _lookup = (booking_ctx or {}).get("_lookup") or {}
+    if _lookup.get("rid_tried") and not _lookup.get("rid_found"):
+        return (
+            f"Non trovo la prenotazione {_lookup['rid_tried']}. "
+            "Per aiutarti subito, mi indichi il nome della struttura? "
+            "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
+        )
 
     # 1) Richieste esplicite: video / corrente
     if wants_video(text) or wants_power(text):
-        session["last_intent"] = "video"
         if not prop:
-            session["awaiting_property_for"] = "video"
+            # se abbiamo pending_confirm in sessione, riproponi la conferma chiara
+            if session.get("pending_confirm"):
+                pc = session["pending_confirm"]
+                return (f"Confermi *{pc['prop']}* dal *{pc['start']}* al *{pc['end']}*? "
+                        "Se sì, posso inviarti i link utili.")
             return ("Per aiutarti, mi dici in quale struttura ti trovi? "
                     "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)")
 
+        # blocco solo se abbiamo reservation e check-in TO_DO
         if explicit_access_request_blocked(booking_ctx):
             return (
                 "Per motivi di sicurezza posso inviarti i link solo dopo la verifica dei documenti. "
@@ -311,7 +343,7 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
             return f"Video check‑in — {prop}: {vlink}"
         return "Sto cercando il video giusto per la tua struttura. Puoi confermare esattamente il nome dell’alloggio?"
 
-    # 2) Invio automatico link se policy OK
+    # 2) Invio automatico link se policy OK (senza richiesta esplicita)
     if should_offer_checkin_assets_auto(booking_ctx):
         if prop:
             parts = ["Benvenuto!"]
@@ -323,16 +355,22 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
                 parts.append(f"Ripristino corrente: {plink}")
             return "\n".join(parts)
 
-    # 3) Transfer
+    # 3) Transfer: raccogliamo dati base
     if wants_transfer(text):
-        session["last_intent"] = "transfer"
         t = (text or "").lower()
+        # persone
         people = None
-        m = re.search(r"\bsiamo in (\d{1,2})\b", t) or re.search(r"\b(\d{1,2}) (persone|adulti|ospiti)\b", t)
+        m = re.search(r"\bsiamo in (\d{1,2})\b", t)
+        if not m:
+            m = re.search(r"\b(\d{1,2}) (persone|adulti|ospiti)\b", t)
         if m:
             people = m.group(1)
+
+        # orario
         time_match = re.search(r"\b(\d{1,2})[:\.](\d{2})\b", text or "")
         when = f"{time_match.group(1)}:{time_match.group(2)}" if time_match else None
+
+        # partenza/destinazione (grezzo)
         src = "aeroporto" if "aeroporto" in t else None
         dst = None
         if prop:
@@ -343,6 +381,8 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
                 "casa di gina": "Casa di Gina",
                 "villino di monic": "Villino di Monic",
             }.get(normalize_property_key(prop), prop)
+
+        # tariffa
         tariffa = None
         if (src and dst) and ("aeroporto" in (src or "")):
             tariffa = KB["transfer_tariffe"]["aeroporto_citta"]
@@ -356,36 +396,16 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
         parts.append(f"• Destinazione: {dst or '—'}")
         if tariffa:
             parts.append(f"\nTariffa: {tariffa}€.")
-        if not dst and not src:
-            session["awaiting_property_for"] = "transfer"
-            parts.append("\nPer completare, indicami il nome esatto della struttura (se è la destinazione).")
         parts.append("Confermi? (sì/no) In caso affermativo, Niccolò ti contatterà a breve.")
         return "\n".join(parts)
 
     # 4) Parcheggio
     if wants_parking(text):
-        session["last_intent"] = "parking"
         if not prop:
-            session["awaiting_property_for"] = "parking"
             return "In quale struttura soggiorni? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
         return f"Parcheggio — {prop}: dimmi se hai esigenze particolari (orari/ingresso) e ti indico la soluzione migliore."
 
-    # 5) Messaggi generici su prenotazioni del tipo “a nome mio?”
-    t_low = (text or "").lower()
-    if "prenotazione" in t_low and any(k in t_low for k in ["mio", "nome mio", "a nome mio", "sul mio numero"]):
-        client = (booking_ctx or {}).get("client") or {}
-        if client:
-            rid_node = (booking_ctx or {}).get("_lookup") or {}
-            tried = rid_node.get("rid_tried")
-            found = rid_node.get("rid_found")
-            if tried and not found:
-                return f"Non trovo la prenotazione {tried}. Puoi indicarmi il nome della struttura? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
-            else:
-                return "Al momento non vedo prenotazioni recenti associate al tuo numero. Dimmi la struttura e ti aiuto subito con accesso, parcheggio o transfer."
-        else:
-            return "Per verificare meglio, mi indichi il nome della struttura? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
-
-    # 6) Default: LLM con contesto
+    # 5) Default: LLM con contesto
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": f"KB transfer tariffs: {json.dumps(KB.get('transfer_tariffe', {}), ensure_ascii=False)}"},
@@ -393,7 +413,7 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
                                        "Se la struttura è ignota e serve per rispondere, chiedila.")},
         {"role": "user", "content": text or ""},
     ]
-    if booking_ctx and isinstance(booking_ctx, dict) and booking_ctx.get("reservation"):
+    if booking_ctx and booking_ctx.get("reservation"):
         res = booking_ctx["reservation"]
         human_res = {
             "status": res.get("status"),
@@ -406,21 +426,17 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any], session: Di
         }
         messages.insert(1, {"role": "system", "content": f"Reservation context: {json.dumps(human_res, ensure_ascii=False)}"})
 
-    # saluto personalizzato se applicabile (come primissima risposta in conversazioni generiche)
-    if client_name and any(greet in (text or "").lower() for greet in ["ciao", "buongiorno", "salve", "hey"]):
-        return f"Ciao {client_name.split()[0]}! Come posso aiutarti oggi? Se hai bisogno di informazioni su transfer, parcheggio o accesso, fammi sapere!"
-
     return call_llm(messages)
 
 def handle_incoming_message(phone: str, text: str) -> str:
+    # bootstrap session + booking ctx
     session = session_store.setdefault(phone, {
         "history": [],
         "booking_ctx": None,
-        "last_intent": None,
-        "awaiting_property_for": None,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat(),
+        "pending_confirm": None,
+        "reservation_confirmed": False,
     })
-
     booking_ctx = get_booking_context(phone, text)
     session["booking_ctx"] = booking_ctx
 
@@ -459,7 +475,7 @@ def debug_ctx():
         logger.exception("debug_ctx error: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# === Pagina test ===
+# === Pagina test locale ===
 TEST_HTML = """
 <!doctype html>
 <html lang="it">
