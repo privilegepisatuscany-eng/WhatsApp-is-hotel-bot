@@ -3,7 +3,7 @@ import os
 import re
 import json
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, Optional
 
 from flask import Flask, request, Response, jsonify
@@ -83,10 +83,13 @@ session_store: Dict[str, Dict[str, Any]] = {}
 SYSTEM_PROMPT = (
     "Sei l’assistente di strutture ricettive a Pisa. "
     "Rispondi in modo chiaro, cortese e conciso. "
-    "Usa SOLO informazioni dalla KB o dal contesto prenotazione. "
+    'Usa SOLO informazioni dalla KB o dal contesto prenotazione. '
     "Se l’utente chiede Transfer, raccogli persone, orario, partenza e destinazione; applica tariffe KB. "
     "Se chiede Parcheggio o Accesso/Video, chiedi la struttura solo se non nota dal contesto. "
-    "Non inventare dettagli: se mancano, chiedi in modo mirato."
+    "Non inventare dettagli: se mancano, chiedi in modo mirato. "
+    "NON dire mai 'non posso accedere ai dettagli della prenotazione': "
+    "se il contesto non è disponibile, chiedi gentilmente il nome della struttura. "
+    "Se conosci il nome dell'ospite, salutalo usando il suo nome."
 )
 
 # === Date helper ===
@@ -141,7 +144,7 @@ def explicit_access_request_blocked(booking_ctx: Dict[str, Any]) -> bool:
 
 # === Property helpers ===
 ALIASES = {
-    "casa monic": ["casa monic", "monic", "casa di monic", "villino di monic?"],  # qualche typo comune
+    "casa monic": ["casa monic", "monic", "casa di monic", "casa monic?", "casa di monic?", "villino di monic"],
     "relais dell’ussero": ["relais", "ussero", "relais dell'ussero", "relais dell’ussero"],
     "belle vue": ["belle vue", "bellevue"],
     "casa di gina": ["casa di gina", "gina"],
@@ -218,20 +221,23 @@ def call_llm(messages, temperature=0.3) -> str:
 RES_ID_RE = re.compile(r"\b(\d{7,12})\b")
 
 def get_booking_context(phone: str, text: str) -> Dict[str, Any]:
-    """
-    Usa sia il telefono sia un eventuale reservation-id nel testo.
-    Il client prova: reservation esplicita -> client by phone -> reservation recente del client.
-    """
     reservation_id = None
     m = RES_ID_RE.search(text or "")
     if m:
         reservation_id = m.group(1)
+    tried = bool(reservation_id)
+    found = False
+    ctx = {}
     try:
-        ctx = CB.get_booking_context(phone=phone or None, reservation_id=reservation_id or None)
+        ctx = CB.get_booking_context(phone=phone or None, reservation_id=reservation_id or None) or {}
+        if reservation_id:
+            found = bool(ctx.get("reservation"))
     except Exception as e:
         logger.error("Errore lookup CiaoBooking: %s", e)
         ctx = {}
-    return ctx or {}
+    ctx.setdefault("_lookup", {})["rid_tried"] = reservation_id if tried else None
+    ctx["_lookup"]["rid_found"] = found
+    return ctx
 
 # === Core business reply ===
 def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
@@ -239,6 +245,21 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
     if (text or "").strip().lower() == "/reset":
         session_store.pop(phone, None)
         return "✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Video/Accesso)"
+
+    # *** BLOCCO 0 — gestione prenotazione non trovata + saluto personalizzato ***
+    _lookup = (booking_ctx or {}).get("_lookup") or {}
+    if _lookup.get("rid_tried") and not _lookup.get("rid_found"):
+        return (
+            f"Non trovo la prenotazione {_lookup['rid_tried']}. "
+            "Per aiutarti subito, mi indichi il nome della struttura? "
+            "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
+        )
+
+    # Saluto personalizzato se conosciamo il nome del cliente e il messaggio è un saluto
+    client_name = (booking_ctx.get("client") or {}).get("name")
+    if client_name and any(g in (text or "").lower() for g in ["ciao", "buongiorno", "salve", "hey", "hola"]):
+        first = client_name.split()[0]
+        return f"Ciao {first}! Come posso aiutarti oggi? Se hai bisogno di informazioni su transfer, parcheggio o accesso, fammi sapere!"
 
     # prova a determinare la property dal contesto o dal testo
     prop_from_ctx = property_name_from_ctx(booking_ctx)
