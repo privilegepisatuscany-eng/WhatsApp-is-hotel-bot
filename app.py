@@ -369,6 +369,23 @@ def webhook():
     sender = normalize_sender(sender_raw)
     logger.debug("Inbound da %s: %s", sender, body)
 
+    booking_ctx = {}
+    try:
+        # Heuristica: prova ad estrarre un reservation_id dal testo
+        reservation_id = None
+        tokens = [t for t in body.split() if t.isdigit()]
+        if tokens:
+            reservation_id = max(tokens, key=len)
+        booking_ctx = CB.get_booking_context(phone=sender, reservation_id=reservation_id)
+    except Exception as e:
+        logger.error("Errore lookup CiaoBooking (phone): %s", e)
+
+    reply = generate_bot_reply(sender=sender, body=body, booking_ctx=booking_ctx)
+
+    twiml = MessagingResponse()
+    twiml.message(reply)
+    return str(twiml)
+    
     # reset conversazione
     if body.lower() == "/reset":
         session_store.pop(sender, None)
@@ -483,26 +500,36 @@ def test_page():
 
 @app.route("/test_api", methods=["POST"])
 def test_api():
-    data = request.get_json(force=True, silent=True) or {}
-    phone = normalize_sender(str(data.get("phone", "")))
-    text = (data.get("text") or "").strip()
-    if not phone:
-        return jsonify({"error": "missing phone"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        phone = (payload.get("phone") or "").replace("+", "").strip()
+        body = (payload.get("body") or "").strip()
 
-    if text.lower() == "/reset":
-        session_store.pop(phone, None)
-        return jsonify({"answer": "✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Video/Accesso)"})
+        if not body:
+            return jsonify({"error": "missing body"}), 400
 
-    session = session_store.setdefault(phone, {"history": [], "booking_ctx": None, "created_at": datetime.utcnow().isoformat()})
-    if not session.get("booking_ctx"):
-        ensure_booking_context(phone, text)
+        # NB: se manca il phone, NON 400. Simuliamo un mittente "anonimo"
+        if not phone:
+            phone = "0000000000"
 
-    answer = build_answer(phone, text)
-    session["history"] = clamp_history(session["history"] + [
-        {"role": "user", "content": text},
-        {"role": "assistant", "content": answer},
-    ])
-    return jsonify({"answer": answer})
+        # Lookup CiaoBooking (best-effort)
+        booking_ctx = {}
+        try:
+            # se il messaggio contiene un ID numerico a 10+ cifre, trattalo come reservation_id
+            reservation_id = None
+            tokens = [t for t in body.split() if t.isdigit()]
+            if tokens:
+                # prendi quello più lungo
+                reservation_id = max(tokens, key=len)
+            booking_ctx = CB.get_booking_context(phone=phone, reservation_id=reservation_id)
+        except Exception as e:
+            logger.error("Errore lookup CiaoBooking (test): %s", e)
+
+        reply = generate_bot_reply(sender=phone, body=body, booking_ctx=booking_ctx)
+        return jsonify({"reply": reply})
+    except Exception as e:
+        logger.exception("Errore /test_api")
+        return jsonify({"error": str(e)}), 500
 
 # === Healthcheck e root ===
 @app.route("/", methods=["GET"])
