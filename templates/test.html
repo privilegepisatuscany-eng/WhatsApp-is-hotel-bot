@@ -2,92 +2,107 @@
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <title>Hotel Bot - Test Console</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Test Bot</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background:#f6f7f8; }
-    header { background:#111827; color:#fff; padding:12px 16px; }
-    main { max-width: 900px; margin: 24px auto; padding: 0 16px; }
-    .card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-    .row { display:flex; gap:12px; padding:16px; align-items:center; }
-    input[type="text"] { padding:10px 12px; border:1px solid #d1d5db; border-radius:8px; width:100%; }
-    button { padding:10px 14px; border:none; background:#111827; color:#fff; border-radius:8px; cursor:pointer; }
-    button:disabled { opacity:.6; cursor:not-allowed; }
-    .chat { padding: 8px 16px 16px; height: 60vh; overflow-y: auto; }
-    .bubble { max-width: 70%; padding:10px 12px; border-radius:10px; margin:8px 0; line-height:1.35 }
-    .me { background:#dbeafe; margin-left:auto; }
-    .bot { background:#f3f4f6; margin-right:auto; }
-    .meta { color:#6b7280; font-size:12px; margin-top:2px; }
-    .row-top { border-bottom:1px solid #e5e7eb; }
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; }
+    #log { border: 1px solid #ddd; padding: 10px; height: 60vh; overflow-y: auto; white-space: pre-wrap; }
+    .msg-me { color: #0b6; }
+    .msg-bot { color: #06c; }
+    .sys { color: #999; font-style: italic; }
+    input, button { font-size: 16px; padding: 8px; }
+    input[type="text"] { flex: 1; }
   </style>
 </head>
 <body>
-  <header><strong>Hotel Bot • Test</strong></header>
-  <main>
-    <div class="card">
-      <div class="row row-top">
-        <div style="flex: 0 0 180px;">
-          <label>Telefono</label>
-          <input id="phone" type="text" placeholder="es. 393470412345" />
-        </div>
-        <div style="flex:1;">
-          <div style="color:#6b7280;font-size:14px">Conversazione di test. I messaggi restano nello storico.</div>
-        </div>
-        <div>
-          <button id="reset">Reset</button>
-        </div>
-      </div>
-      <div id="chat" class="chat"></div>
-      <div class="row">
-        <input id="msg" type="text" placeholder="Scrivi un messaggio…" />
-        <button id="send">Invia</button>
-      </div>
-    </div>
-  </main>
-  <script>
-    const chat = document.getElementById('chat');
-    const phoneInput = document.getElementById('phone');
-    const msgInput = document.getElementById('msg');
-    const sendBtn = document.getElementById('send');
-    const resetBtn = document.getElementById('reset');
+  <div id="log"></div>
 
-    function append(role, text){
-      const wrap = document.createElement('div');
-      wrap.className = 'bubble ' + (role === 'me' ? 'me' : 'bot');
-      wrap.textContent = text;
-      chat.appendChild(wrap);
-      chat.scrollTop = chat.scrollHeight;
+  <div class="row">
+    <input id="phone" type="text" placeholder="Telefono (es. 3934...)" />
+    <button id="setPhone">Imposta</button>
+  </div>
+
+  <div class="row">
+    <input id="text" type="text" placeholder="Scrivi un messaggio..." />
+    <button id="send">Invia</button>
+    <button id="reset">Reset</button>
+  </div>
+
+  <script>
+    const log = document.getElementById('log');
+    const phoneInput = document.getElementById('phone');
+    const textInput = document.getElementById('text');
+
+    function addLine(html, cls="") {
+      const p = document.createElement('div');
+      p.className = cls;
+      p.innerHTML = html;
+      log.appendChild(p);
+      log.scrollTop = log.scrollHeight;
     }
 
-    sendBtn.onclick = async () => {
-      const phone = phoneInput.value.trim();
-      const text = msgInput.value.trim();
-      if(!phone){ alert('Inserisci telefono (solo numeri)'); return; }
-      if(!text){ return; }
-      append('me', text);
-      msgInput.value = '';
-      sendBtn.disabled = true;
-      try{
-        const fd = new FormData();
-        fd.append('phone', phone);
-        fd.append('text', text);
-        const r = await fetch('/test_api', { method:'POST', body: fd });
-        const js = await r.json();
-        if(js.ok){
-          append('bot', js.reply);
-        } else {
-          append('bot', 'Errore: ' + (js.error || 'unknown'));
+    function getPhone() {
+      return localStorage.getItem('test_phone') || "";
+    }
+
+    function setPhone(p) {
+      localStorage.setItem('test_phone', p);
+      addLine(`sys: Telefono impostato a ${p}`, 'sys');
+    }
+
+    // Init
+    (function() {
+      const p = getPhone();
+      if (p) phoneInput.value = p;
+      addLine('sys: Conversazione pronta. Inserisci telefono e invia il primo messaggio.', 'sys');
+    })();
+
+    document.getElementById('setPhone').onclick = () => {
+      const p = phoneInput.value.trim().replace(/^\+/, '');
+      if (!p) return;
+      setPhone(p);
+    };
+
+    document.getElementById('send').onclick = async () => {
+      const phone = getPhone();
+      const body = textInput.value.trim();
+      if (!phone || !body) {
+        addLine('sys: serve telefono e messaggio.', 'sys');
+        return;
+      }
+      addLine(`me: ${body}`, 'msg-me');
+
+      try {
+        const resp = await fetch('/test_api', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ phone, body })
+        });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          addLine(`sys: errore ${resp.status} - ${txt}`, 'sys');
+          return;
         }
-      }catch(e){
-        append('bot', 'Errore di rete');
-      }finally{
-        sendBtn.disabled = false;
+        const data = await resp.json();
+        addLine(`bot: ${data.reply}`, 'msg-bot');
+      } catch (e) {
+        addLine(`sys: errore di rete: ${e}`, 'sys');
+      } finally {
+        textInput.value = '';
       }
     };
 
-    resetBtn.onclick = () => {
-      msgInput.value = '/reset';
-      sendBtn.onclick();
+    document.getElementById('reset').onclick = async () => {
+      const phone = getPhone();
+      if (!phone) { addLine('sys: imposta prima il telefono.', 'sys'); return; }
+      try {
+        const r = await fetch(`/reset_session?phone=${encodeURIComponent(phone)}`, { method: 'POST' });
+        if (r.ok) addLine('sys: sessione resettata.', 'sys');
+        else addLine(`sys: reset fallito (${r.status})`, 'sys');
+      } catch (e) {
+        addLine(`sys: errore di rete: ${e}`, 'sys');
+      }
     };
   </script>
 </body>
