@@ -3,7 +3,7 @@ import os
 import re
 import json
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Any, Dict, Optional
 
 from flask import Flask, request, Response, jsonify
@@ -75,6 +75,7 @@ CB = CiaoBookingClient(
 # session_store[phone] = {
 #   "history": [...],
 #   "booking_ctx": {...},
+#   "last_property": "casa di gina",
 #   "created_at": ISO
 # }
 session_store: Dict[str, Dict[str, Any]] = {}
@@ -83,7 +84,7 @@ session_store: Dict[str, Dict[str, Any]] = {}
 SYSTEM_PROMPT = (
     "Sei l’assistente di strutture ricettive a Pisa. "
     "Rispondi in modo chiaro, cortese e conciso. "
-    'Usa SOLO informazioni dalla KB o dal contesto prenotazione. '
+    "Usa SOLO informazioni dalla KB o dal contesto prenotazione. "
     "Se l’utente chiede Transfer, raccogli persone, orario, partenza e destinazione; applica tariffe KB. "
     "Se chiede Parcheggio o Accesso/Video, chiedi la struttura solo se non nota dal contesto. "
     "Non inventare dettagli: se mancano, chiedi in modo mirato. "
@@ -97,7 +98,6 @@ def _parse_ymd(d: Optional[str]) -> Optional[date]:
     if not d:
         return None
     try:
-        # accetta YYYY-MM-DD
         if len(d) >= 10:
             return date.fromisoformat(d[:10])
     except Exception:
@@ -144,7 +144,7 @@ def explicit_access_request_blocked(booking_ctx: Dict[str, Any]) -> bool:
 
 # === Property helpers ===
 ALIASES = {
-    "casa monic": ["casa monic", "monic", "casa di monic", "casa monic?", "casa di monic?", "villino di monic"],
+    "casa monic": ["casa monic", "monic", "casa di monic", "villino di monic"],
     "relais dell’ussero": ["relais", "ussero", "relais dell'ussero", "relais dell’ussero"],
     "belle vue": ["belle vue", "bellevue"],
     "casa di gina": ["casa di gina", "gina"],
@@ -159,7 +159,7 @@ def extract_property_from_text(text: str) -> Optional[str]:
         for a in arr:
             if a in t:
                 return canonical
-    # fallback: cerca match diretto con chiavi KB
+    # fallback: match diretto su chiavi KB
     for k in KB.get("videos", {}):
         if k in t:
             return k
@@ -220,6 +220,54 @@ def call_llm(messages, temperature=0.3) -> str:
 # === CiaoBooking bootstrap ===
 RES_ID_RE = re.compile(r"\b(\d{7,12})\b")
 
+def _cb_get_booking_context(phone: str, reservation_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Wrapper robusto:
+    - usa CB.get_booking_context se esiste
+    - altrimenti fa il lookup 'a mano' (compat con client vecchi)
+    """
+    ctx: Dict[str, Any] = {"client": None, "reservation": None}
+
+    # 1) Se la classe ha il metodo ufficiale, delego
+    cb_method = getattr(CB, "get_booking_context", None)
+    if callable(cb_method):
+        return cb_method(phone=phone or None, reservation_id=reservation_id or None) or ctx
+
+    # 2) Fallback manuale (compat con client vecchi)
+    try:
+        # by reservation id
+        if reservation_id:
+            try:
+                res = CB.get_reservation(reservation_id)
+            except Exception:
+                res = None
+            if res:
+                try:
+                    norm = CB._normalize_reservation(res)  # type: ignore[attr-defined]
+                except Exception:
+                    norm = res
+                    if "property_name" not in norm:
+                        prop = (res.get("property") or {}).get("name")
+                        if prop:
+                            norm["property_name"] = prop
+                ctx["reservation"] = norm
+
+        # by phone -> client
+        if phone and not ctx.get("reservation"):
+            try:
+                raw = CB.search_clients_by_phone(phone)
+                coll = (raw.get("collection") if isinstance(raw, dict) else None) or []
+                client = coll[0] if coll else None
+                if client:
+                    ctx["client"] = client
+            except Exception:
+                pass
+
+        return ctx
+    except Exception as e:
+        logger.error("Errore fallback CiaoBooking: %s", e)
+        return ctx
+
 def get_booking_context(phone: str, text: str) -> Dict[str, Any]:
     reservation_id = None
     m = RES_ID_RE.search(text or "")
@@ -227,26 +275,30 @@ def get_booking_context(phone: str, text: str) -> Dict[str, Any]:
         reservation_id = m.group(1)
     tried = bool(reservation_id)
     found = False
-    ctx = {}
+
     try:
-        ctx = CB.get_booking_context(phone=phone or None, reservation_id=reservation_id or None) or {}
+        ctx = _cb_get_booking_context(phone, reservation_id)
         if reservation_id:
-            found = bool(ctx.get("reservation"))
+            found = bool((ctx or {}).get("reservation"))
     except Exception as e:
         logger.error("Errore lookup CiaoBooking: %s", e)
         ctx = {}
+
+    ctx = ctx or {}
     ctx.setdefault("_lookup", {})["rid_tried"] = reservation_id if tried else None
     ctx["_lookup"]["rid_found"] = found
     return ctx
 
 # === Core business reply ===
 def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
+    tlow = (text or "").strip().lower()
+
     # reset conv?
-    if (text or "").strip().lower() == "/reset":
+    if tlow == "/reset":
         session_store.pop(phone, None)
         return "✅ Conversazione resettata. Come posso aiutarti? (Taxi/Transfer, Parcheggio o Video/Accesso)"
 
-    # *** BLOCCO 0 — gestione prenotazione non trovata + saluto personalizzato ***
+    # 0) Se abbiamo provato un reservation_id e non trovato -> chiedi subito la struttura
     _lookup = (booking_ctx or {}).get("_lookup") or {}
     if _lookup.get("rid_tried") and not _lookup.get("rid_found"):
         return (
@@ -255,16 +307,17 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
             "(Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
         )
 
-    # Saluto personalizzato se conosciamo il nome del cliente e il messaggio è un saluto
-    client_name = (booking_ctx.get("client") or {}).get("name")
-    if client_name and any(g in (text or "").lower() for g in ["ciao", "buongiorno", "salve", "hey", "hola"]):
+    # 0-bis) Saluto personalizzato se abbiamo il nome e il messaggio è un saluto
+    client_name = ((booking_ctx.get("client") or {}).get("name") or "").strip()
+    if client_name and any(g in tlow for g in ["ciao", "buongiorno", "buonasera", "salve", "hey"]):
         first = client_name.split()[0]
         return f"Ciao {first}! Come posso aiutarti oggi? Se hai bisogno di informazioni su transfer, parcheggio o accesso, fammi sapere!"
 
-    # prova a determinare la property dal contesto o dal testo
+    # prova a determinare la property dal contesto, dal testo o dalla memoria
     prop_from_ctx = property_name_from_ctx(booking_ctx)
     prop_from_text = extract_property_from_text(text)
-    prop = prop_from_ctx or prop_from_text
+    last_prop = (session_store.get(phone) or {}).get("last_property")
+    prop = prop_from_ctx or prop_from_text or last_prop
 
     # 1) Richieste esplicite: video / corrente
     if wants_video(text) or wants_power(text):
@@ -307,12 +360,11 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
 
     # 3) Transfer: raccogliamo dati base
     if wants_transfer(text):
-        t = (text or "").lower()
         # persone
         people = None
-        m = re.search(r"\bsiamo in (\d{1,2})\b", t)
+        m = re.search(r"\bsiamo in (\d{1,2})\b", tlow)
         if not m:
-            m = re.search(r"\b(\d{1,2}) (persone|adulti|ospiti)\b", t)
+            m = re.search(r"\b(\d{1,2}) (persone|adulti|ospiti)\b", tlow)
         if m:
             people = m.group(1)
 
@@ -321,7 +373,7 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
         when = f"{time_match.group(1)}:{time_match.group(2)}" if time_match else None
 
         # partenza/destinazione (grezzo)
-        src = "aeroporto" if "aeroporto" in t else None
+        src = "aeroporto" if "aeroporto" in tlow else None
         dst = None
         if prop:
             dst = {
@@ -349,7 +401,7 @@ def build_answer(phone: str, text: str, booking_ctx: Dict[str, Any]) -> str:
         parts.append("Confermi? (sì/no) In caso affermativo, Niccolò ti contatterà a breve.")
         return "\n".join(parts)
 
-    # 4) Parcheggio: chiedi property se manca
+    # 4) Parcheggio
     if wants_parking(text):
         if not prop:
             return "In quale struttura soggiorni? (Relais dell’Ussero, Casa Monic, Belle Vue, Villino di Monic, Casa di Gina)"
@@ -384,6 +436,11 @@ def handle_incoming_message(phone: str, text: str) -> str:
     booking_ctx = get_booking_context(phone, text)
     session["booking_ctx"] = booking_ctx
 
+    # se l’utente nomina una struttura, memorizzala
+    mentioned_prop = extract_property_from_text(text)
+    if mentioned_prop:
+        session["last_property"] = mentioned_prop
+
     answer = build_answer(phone, text, booking_ctx)
     session["history"] = clamp_history(session["history"] + [
         {"role": "user", "content": text},
@@ -413,7 +470,7 @@ def debug_ctx():
     if not phone and not rid:
         return jsonify({"error": "specify phone= or rid="}), 400
     try:
-        ctx = CB.get_booking_context(phone=phone or None, reservation_id=rid or None)
+        ctx = _cb_get_booking_context(phone=phone or "", reservation_id=rid or None)
         return jsonify({"ok": True, "ctx": ctx}), 200
     except Exception as e:
         logger.exception("debug_ctx error: %s", e)
@@ -490,8 +547,15 @@ async function send(){
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ phone: PHONE, message: t })
     });
-    const j = await r.json();
-    add('bot', j.answer || j.reply || '(nessuna risposta)');
+    let j;
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      j = await r.json();
+      add('bot', j.answer || j.reply || '(nessuna risposta)');
+    } else {
+      const txt = await r.text();
+      add('bot', 'Errore server: ' + txt.slice(0, 200));
+    }
   }catch(e){
     add('bot', 'Errore: ' + e);
   }
